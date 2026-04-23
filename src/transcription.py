@@ -116,6 +116,12 @@ def llm_polish(transcription):
         )
         polished = response.choices[0].message.content
         ConfigManager.console_print(f'LLM polish: raw="{transcription.strip()}" → polished="{polished}"')
+
+        # Guard: if output is 3x+ longer than input, the model hallucinated — return raw
+        if len(transcription.strip()) > 10 and len(polished) > len(transcription.strip()) * 3:
+            ConfigManager.console_print(f'LLM polish hallucination detected ({len(polished)} chars out vs {len(transcription.strip())} in), returning raw transcription')
+            return transcription
+
         return polished
     except Exception as e:
         ConfigManager.console_print(f'LLM polish error (returning raw transcription): {e}')
