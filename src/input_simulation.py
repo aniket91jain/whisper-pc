@@ -112,12 +112,13 @@ class InputSimulator:
         elif self.input_method == 'dotool':
             self._typewrite_dotool(text, interval)
 
-    def _focused_text_control(self):
-        """Locate the focused text-input control in the foreground window.
+    def _foreground_focus(self):
+        """Return (focus_hwnd, class_name) for the currently focused control.
 
-        Returns (focus_hwnd, class_name) when a known text-input class is
-        focused, otherwise None. Single Win32 round-trip shared by both the
-        focus check and the smart leading-space lookup.
+        Returns the focus regardless of whether the class is a known text
+        input. Caller decides whether to attempt paste vs. apply smart
+        features. Returns None only when there is no foreground window or
+        no focused control at all.
         """
         try:
             user32 = ctypes.windll.user32
@@ -132,31 +133,35 @@ class InputSimulator:
             focus_hwnd = info.hwndFocus or hwnd
             buf = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(focus_hwnd, buf, 256)
-            class_name = buf.value
-            if class_name not in self._TEXT_INPUT_CLASSES:
-                return None
-            return (focus_hwnd, class_name)
+            return (focus_hwnd, buf.value)
         except Exception:
             return None
+
+    def _focused_text_control(self):
+        """Return (hwnd, class) only when class is a known text-input control."""
+        focus = self._foreground_focus()
+        if focus is not None and focus[1] in self._TEXT_INPUT_CLASSES:
+            return focus
+        return None
 
     def _is_text_input_focused(self):
         """Return True if the foreground window's focused control is a known text input."""
         return self._focused_text_control() is not None
 
-    def _char_before_cursor(self, focus_hwnd, class_name):
-        """Return the character immediately before the cursor in the focused field.
+    def _text_before_cursor(self, focus_hwnd, class_name, max_chars=8):
+        """Return up to max_chars characters before the cursor.
 
         Returns:
-            ''   - cursor is at position 0; no preceding char.
-            str  - the preceding character (single code unit).
+            ''   - cursor is at position 0; no preceding chars.
+            str  - up to max_chars preceding chars, in normal order.
             None - couldn't determine (active selection, ambiguous probe, error).
         """
         if class_name in self._NATIVE_TEXT_CLASSES:
-            return self._char_before_cursor_native(focus_hwnd)
-        return self._char_before_cursor_probe()
+            return self._text_before_cursor_native(focus_hwnd, max_chars)
+        return self._text_before_cursor_probe()
 
     @staticmethod
-    def _char_before_cursor_native(focus_hwnd):
+    def _text_before_cursor_native(focus_hwnd, max_chars):
         """Win32 fast path: EM_GETSEL + WM_GETTEXT against the focused control."""
         try:
             user32 = ctypes.windll.user32
@@ -169,7 +174,7 @@ class InputSimulator:
             user32.SendMessageW(focus_hwnd, EM_GETSEL,
                                 ctypes.byref(start), ctypes.byref(end))
             if start.value != end.value:
-                # Live selection — paste will overwrite; don't add a space.
+                # Live selection — paste will overwrite; don't apply adjustments.
                 return None
             if start.value == 0:
                 return ''
@@ -177,23 +182,28 @@ class InputSimulator:
             length = user32.SendMessageW(focus_hwnd, WM_GETTEXTLENGTH, 0, 0)
             if length <= 0 or start.value > length:
                 return ''
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.SendMessageW(focus_hwnd, WM_GETTEXT, length + 1, buf)
+            # Read just enough to cover positions 0..start (no offset arg in WM_GETTEXT).
+            buf = ctypes.create_unicode_buffer(start.value + 1)
+            user32.SendMessageW(focus_hwnd, WM_GETTEXT, start.value + 1, buf)
             text = buf.value
-            if start.value - 1 >= len(text):
-                return ''
-            return text[start.value - 1]
+            cutoff = min(start.value, len(text))
+            return text[max(0, cutoff - max_chars):cutoff]
         except Exception:
             return None
 
-    def _char_before_cursor_probe(self):
-        """Clipboard probe fallback: select one char left, copy, restore."""
+    def _text_before_cursor_probe(self):
+        """Clipboard probe fallback: select up to 2 chars left, copy, restore.
+
+        Two chars is enough to disambiguate the most common sentence-boundary
+        case ('. ' vs ' '): a single trailing space looks the same in both,
+        but the second char from the cursor reveals which.
+        """
         try:
             saved = pyperclip.paste()
         except Exception:
             saved = ''
         try:
-            # Multi-char so it can never be confused with a single preceding char.
+            # Multi-char so it can never be confused with the preceding 1-2 chars.
             sentinel = '__WW_PROBE_SENTINEL__'
             try:
                 pyperclip.copy(sentinel)
@@ -201,6 +211,8 @@ class InputSimulator:
                 return None
             time.sleep(0.02)
             with self.keyboard.pressed(Key.shift):
+                self.keyboard.press(Key.left)
+                self.keyboard.release(Key.left)
                 self.keyboard.press(Key.left)
                 self.keyboard.release(Key.left)
             time.sleep(0.02)
@@ -219,7 +231,7 @@ class InputSimulator:
             if probe == sentinel:
                 # Clipboard untouched - nothing was selected (cursor at start).
                 return ''
-            if len(probe) == 1:
+            if 1 <= len(probe) <= 2:
                 return probe
             # Apps that "smart-copy" the current line on empty selection
             # produce ambiguous results - bail out conservatively.
@@ -229,6 +241,55 @@ class InputSimulator:
                 pyperclip.copy(saved)
             except Exception:
                 pass
+
+    @staticmethod
+    def _decide_text_adjustments(context):
+        """Given preceding-text context, decide (prepend_space, lowercase_first).
+
+        prepend_space: True if there's a non-whitespace char immediately
+            before the cursor, so the new text would otherwise run on.
+
+        lowercase_first: True if the cursor is mid-sentence (preceded by
+            content that does NOT end in a sentence terminator or newline).
+            False at sentence boundaries (start of doc/line, after .!?).
+        """
+        if context is None:
+            return (False, False)
+        if context == '':
+            return (False, False)
+
+        last = context[-1]
+        prepend_space = last not in (' ', '\t', '\n', '\r')
+
+        stripped = context.rstrip(' \t')
+        if not stripped:
+            lowercase_first = False
+        elif stripped[-1] in ('\n', '\r'):
+            lowercase_first = False
+        elif stripped[-1] in '.!?':
+            lowercase_first = False
+        else:
+            lowercase_first = True
+
+        return (prepend_space, lowercase_first)
+
+    @staticmethod
+    def _lowercase_first_word(text):
+        """Lowercase the first letter of text, but skip likely proper nouns
+        and the English pronoun 'I'."""
+        if not text or not text[0].isupper():
+            return text
+        # Find the end of the first alphabetic run.
+        i = 0
+        while i < len(text) and text[i].isalpha():
+            i += 1
+        first_word = text[:i]
+        if first_word == 'I':
+            return text  # English pronoun; keep capitalised.
+        # If the first two letters are both upper, treat as acronym (JJ, USA).
+        if len(first_word) >= 2 and first_word[1].isupper():
+            return text
+        return text[0].lower() + text[1:]
 
     def _typewrite_sendinput(self, text):
         """Send entire text in one batched Windows SendInput call (instantaneous)."""
@@ -271,31 +332,47 @@ class InputSimulator:
             ctypes.windll.user32.SendInput(n, (INPUT * n)(*inputs), ctypes.sizeof(INPUT))
 
     def _typewrite_clipboard(self, text):
-        focus = self._focused_text_control()
-        if focus is not None:
-            if ConfigManager.get_config_value('post_processing', 'add_leading_space_if_needed'):
-                ch = self._char_before_cursor(*focus)
-                if ch and not ch.isspace():
+        focus = self._foreground_focus()
+        if focus is None:
+            # No foreground window / focus at all - leave in clipboard for manual paste.
+            pyperclip.copy(text)
+            return
+
+        focus_hwnd, class_name = focus
+        is_known_text = class_name in self._TEXT_INPUT_CLASSES
+
+        if is_known_text:
+            want_space = ConfigManager.get_config_value(
+                'post_processing', 'add_leading_space_if_needed')
+            want_lower = ConfigManager.get_config_value(
+                'post_processing', 'lowercase_first_letter_mid_sentence')
+            if want_space or want_lower:
+                context = self._text_before_cursor(focus_hwnd, class_name)
+                prepend_space, lowercase_first = self._decide_text_adjustments(context)
+                if want_space and prepend_space:
                     text = ' ' + text
-            # Save whatever the user had copied, paste transcription, then restore.
-            # Ctrl+V is the only truly instantaneous path (browsers process WM_CHAR one at a time).
-            try:
-                saved = pyperclip.paste()
-            except Exception:
-                saved = ''
-            pyperclip.copy(text)
-            time.sleep(0.05)
-            with self.keyboard.pressed(Key.ctrl):
-                self.keyboard.press('v')
-                self.keyboard.release('v')
-            time.sleep(0.1)
-            try:
-                pyperclip.copy(saved)
-            except Exception:
-                pass
-        else:
-            # No text field focused; leave transcription in clipboard for manual pasting
-            pyperclip.copy(text)
+                if want_lower and lowercase_first:
+                    text = self._lowercase_first_word(text)
+
+        # Save whatever the user had copied, paste transcription, then restore.
+        # Ctrl+V is the only truly instantaneous path (browsers process WM_CHAR one at a time).
+        # We paste even for unknown-class focus targets (Word's _WwG, modern Notepad,
+        # etc.) — Ctrl+V is universally "paste" and is harmless if the focus turns
+        # out to not accept text.
+        try:
+            saved = pyperclip.paste()
+        except Exception:
+            saved = ''
+        pyperclip.copy(text)
+        time.sleep(0.05)
+        with self.keyboard.pressed(Key.ctrl):
+            self.keyboard.press('v')
+            self.keyboard.release('v')
+        time.sleep(0.1)
+        try:
+            pyperclip.copy(saved)
+        except Exception:
+            pass
 
     def _typewrite_pynput(self, text, interval):
         """

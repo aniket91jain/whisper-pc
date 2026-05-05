@@ -142,6 +142,10 @@ post_processing:
     value: true
     type: bool
     description: "Set to true to prepend a space when pasting into a focused text field whose cursor is preceded by a non-whitespace character. Empty fields, fields ending in whitespace/newline, and fields with the cursor at position 0 are never prefixed."
+  lowercase_first_letter_mid_sentence:
+    value: true
+    type: bool
+    description: "Set to true to lowercase the first letter of a transcription when the cursor is mid-sentence (preceding text doesn't end in a sentence terminator or newline). Skips the English pronoun 'I' and likely acronyms (words whose first two letters are both uppercase) to preserve correctness."
   remove_capitalization:
     value: false
     type: bool

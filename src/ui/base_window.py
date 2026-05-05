@@ -4,11 +4,12 @@ from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLay
 
 
 class BaseWindow(QMainWindow):
-    def __init__(self, title, width, height, show_title_bar=True):
+    def __init__(self, title, width, height, show_title_bar=True, background_alpha=220):
         """
         Initialize the base window.
         """
         super().__init__()
+        self.background_alpha = background_alpha
         self.initUI(title, width, height, show_title_bar)
         self.setWindowPosition()
         self.is_dragging = False
@@ -114,6 +115,6 @@ class BaseWindow(QMainWindow):
         path.addRoundedRect(QRectF(self.rect()), 20, 20)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
+        painter.setBrush(QBrush(QColor(255, 255, 255, self.background_alpha)))
         painter.setPen(Qt.NoPen)
         painter.drawPath(path)
