@@ -1,7 +1,10 @@
+import datetime
+import os
 import time
 import traceback
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 import tempfile
 import wave
 import webrtcvad
@@ -9,7 +12,7 @@ from PyQt5.QtCore import QThread, QMutex, pyqtSignal
 from collections import deque
 from threading import Event
 
-from transcription import transcribe
+from transcription import transcribe, TranscriptionAPIError
 from utils import ConfigManager
 
 
@@ -27,10 +30,12 @@ class ResultThread(QThread):
     Signals:
         statusSignal: Emits the current status of the thread (e.g., 'recording', 'transcribing', 'idle')
         resultSignal: Emits the transcription result
+        failedSignal: Emits (audio_path, error_reason) when the API fails after recording
     """
 
     statusSignal = pyqtSignal(str)
     resultSignal = pyqtSignal(str)
+    failedSignal = pyqtSignal(str, str)
 
     def __init__(self, local_model=None):
         """
@@ -61,6 +66,7 @@ class ResultThread(QThread):
 
     def run(self):
         """Main execution method for the thread."""
+        audio_data = None
         try:
             if not self.is_running:
                 return
@@ -94,15 +100,64 @@ class ResultThread(QThread):
             if not self.is_running:
                 return
 
+            if not result.strip():
+                # Whisper produced nothing usable (silence, hallucination filter,
+                # RMS skip). Surface "Nothing transcribable detected" via the
+                # status overlay and skip the paste, but still emit an empty
+                # result so continuous-mode / key listener re-arming runs.
+                self.statusSignal.emit('no_speech')
+                self.resultSignal.emit('')
+                return
+
             self.statusSignal.emit('idle')
             self.resultSignal.emit(result)
 
+        except TranscriptionAPIError as e:
+            traceback.print_exc()
+            ConfigManager.console_print(f'Transcription API failure: {e.reason}')
+            if audio_data is not None and audio_data.size > 0:
+                self._persist_failed_recording(audio_data, e.reason)
+            self.statusSignal.emit('error')
+            # Emit empty result so the existing post-completion flow runs
+            # (key listener restart, continuous-mode re-arm).
+            self.resultSignal.emit('')
         except Exception as e:
             traceback.print_exc()
             self.statusSignal.emit('error')
             self.resultSignal.emit('')
         finally:
             self.stop_recording()
+
+    def _persist_failed_recording(self, audio_data, reason):
+        """Save audio to failed/<timestamp>.wav and append an entry to failed_log.txt."""
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        failed_dir = os.path.join(project_root, 'failed')
+        try:
+            os.makedirs(failed_dir, exist_ok=True)
+        except Exception as e:
+            ConfigManager.console_print(f'Could not create failed/ dir: {e}')
+            return
+
+        now = datetime.datetime.now()
+        ts_human = now.strftime('%Y-%m-%d %H:%M:%S')
+        fname = now.strftime('%Y-%m-%d_%H-%M-%S_%f') + '.wav'
+        audio_path = os.path.join(failed_dir, fname)
+
+        try:
+            sf.write(audio_path, audio_data, self.sample_rate or 16000)
+        except Exception as e:
+            ConfigManager.console_print(f'Could not save failed audio: {e}')
+            return
+
+        rel_path = os.path.relpath(audio_path, project_root).replace(os.sep, '/')
+        log_path = os.path.join(project_root, 'failed_log.txt')
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f'[{ts_human}]\n  AUDIO:    {rel_path}\n  ERROR:    {reason}\n\n')
+        except Exception as e:
+            ConfigManager.console_print(f'Could not write failed_log.txt: {e}')
+
+        self.failedSignal.emit(audio_path, reason)
 
     def _record_audio(self):
         """

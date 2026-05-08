@@ -54,7 +54,9 @@ class WhisperWriterApp(QObject):
         self.local_model = create_local_model() if not model_options.get('use_api') else None
 
         self.result_thread = None
-        self._log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcript_log.txt')
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._log_path = os.path.join(project_root, 'transcript_log.txt')
+        self._failed_log_path = os.path.join(project_root, 'failed_log.txt')
         self._history_window = None
 
         self.main_window = MainWindow()
@@ -108,7 +110,12 @@ class WhisperWriterApp(QObject):
 
     def _open_transcript_log(self):
         if self._history_window is None:
-            self._history_window = TranscriptHistoryWindow(self._log_path)
+            self._history_window = TranscriptHistoryWindow(
+                self._log_path,
+                self._failed_log_path,
+                self.local_model,
+                self.input_simulator,
+            )
         else:
             self._history_window._load()
         self._history_window.show()
@@ -173,6 +180,7 @@ class WhisperWriterApp(QObject):
             self.result_thread.statusSignal.connect(self.status_window.updateStatus)
             self.status_window.closeSignal.connect(self.stop_result_thread)
         self.result_thread.resultSignal.connect(self.on_transcription_complete)
+        self.result_thread.failedSignal.connect(self.on_transcription_failed)
         self.result_thread.start()
 
     def stop_result_thread(self):
@@ -182,11 +190,23 @@ class WhisperWriterApp(QObject):
         if self.result_thread and self.result_thread.isRunning():
             self.result_thread.stop()
 
+    def on_transcription_failed(self, audio_path, reason):
+        """Audio captured but the API call failed. Audio + log entry are already
+        on disk; just refresh the history window so the user sees the new row."""
+        ConfigManager.console_print(f'Transcription failed; audio saved to {audio_path} ({reason})')
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window._load()
+
     def on_transcription_complete(self, result):
         """
         When the transcription is complete, type the result and start listening for the activation key again.
         """
-        self.input_simulator.typewrite(result)
+        # Empty result reaches here on silent recordings (status overlay shows
+        # "Nothing transcribable detected") and on API failures. Skip the paste
+        # so we don't clobber the user's clipboard or fire a stray Ctrl+V — but
+        # still run beep / re-arm so the activation flow stays consistent.
+        if result and result.strip():
+            self.input_simulator.typewrite(result)
 
         if ConfigManager.get_config_value('misc', 'noise_on_completion'):
             AudioPlayer(os.path.join('assets', 'beep.wav')).play(block=True)

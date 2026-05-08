@@ -1,11 +1,18 @@
 import sys
 import os
 from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QPixmap, QFont
 from PyQt5.QtWidgets import QApplication, QLabel, QHBoxLayout, QPushButton
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from ui.base_window import BaseWindow
+
+# The icon-only window is sized for a 48px pixmap; the no-speech message needs
+# more horizontal room for the "Nothing transcribable detected" text.
+_ICON_SIZE = (80, 110)
+_MESSAGE_SIZE = (300, 70)
+_NO_SPEECH_DISMISS_MS = 2500
+
 
 class StatusWindow(BaseWindow):
     statusSignal = pyqtSignal(str)
@@ -15,10 +22,13 @@ class StatusWindow(BaseWindow):
         """
         Initialize the status window.
         """
-        super().__init__('WhisperWriter Status', 80, 110,
+        super().__init__('WhisperWriter Status', _ICON_SIZE[0], _ICON_SIZE[1],
                          show_title_bar=False, background_alpha=180)
         self.initStatusUI()
         self.statusSignal.connect(self.updateStatus)
+        self._dismiss_timer = QTimer(self)
+        self._dismiss_timer.setSingleShot(True)
+        self._dismiss_timer.timeout.connect(self.close)
 
     def initStatusUI(self):
         """
@@ -67,8 +77,18 @@ class StatusWindow(BaseWindow):
         icon_row.addWidget(self.icon_label)
         icon_row.addStretch(1)
 
+        # Message label, shown in place of the icon for transient feedback like
+        # "Nothing transcribable detected". Hidden during normal recording/transcribing.
+        self.message_label = QLabel()
+        self.message_label.setAlignment(Qt.AlignCenter)
+        self.message_label.setFont(QFont('Segoe UI', 10))
+        self.message_label.setStyleSheet('color: #404040;')
+        self.message_label.setWordWrap(True)
+        self.message_label.hide()
+
         self.main_layout.addStretch(1)
         self.main_layout.addLayout(icon_row)
+        self.main_layout.addWidget(self.message_label)
         self.main_layout.addStretch(1)
 
     def show(self):
@@ -88,6 +108,21 @@ class StatusWindow(BaseWindow):
         self.move(x, y)
         super().show()
 
+    def _show_icon_mode(self):
+        """Hide the message label, show the icon, and restore icon-mode size."""
+        self.message_label.hide()
+        self.icon_label.show()
+        if (self.width(), self.height()) != _ICON_SIZE:
+            self.setFixedSize(*_ICON_SIZE)
+
+    def _show_message_mode(self, text):
+        """Swap the icon for a message and resize the window to fit it."""
+        self.icon_label.hide()
+        self.message_label.setText(text)
+        self.message_label.show()
+        if (self.width(), self.height()) != _MESSAGE_SIZE:
+            self.setFixedSize(*_MESSAGE_SIZE)
+
     def closeEvent(self, event):
         """
         Emit the close signal when the window is closed.
@@ -101,12 +136,22 @@ class StatusWindow(BaseWindow):
         Update the status window based on the given status.
         """
         if status == 'recording':
+            self._dismiss_timer.stop()
+            self._show_icon_mode()
             self.icon_label.setPixmap(self.microphone_pixmap)
             self.show()
         elif status == 'transcribing':
+            self._dismiss_timer.stop()
+            self._show_icon_mode()
             self.icon_label.setPixmap(self.pencil_pixmap)
+        elif status == 'no_speech':
+            self._show_message_mode('Nothing transcribable detected')
+            self.show()
+            self._dismiss_timer.start(_NO_SPEECH_DISMISS_MS)
+            return
 
         if status in ('idle', 'error', 'cancel'):
+            self._dismiss_timer.stop()
             self.close()
 
 

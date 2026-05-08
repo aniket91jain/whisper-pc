@@ -7,6 +7,16 @@ from openai import OpenAI
 
 from utils import ConfigManager
 
+
+class TranscriptionAPIError(Exception):
+    """Raised when the remote transcription API call fails (no internet,
+    timeout, empty response). Caught by result_thread.run() so the captured
+    audio can be persisted for a Retry."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
 # Phrases Whisper is known to hallucinate on silence or near-silence.
 # Matched case-insensitively against the stripped transcription.
 _WHISPER_HALLUCINATIONS = frozenset({
@@ -35,6 +45,47 @@ _SPOKEN_COMMA_INLINE = re.compile(r'(?<=\w)\s+comma(?=\s+\w)', re.IGNORECASE)
 def _normalize_spoken_symbols(text: str) -> str:
     text = _SPOKEN_COMMA_DOUBLE.sub(',', text)
     text = _SPOKEN_COMMA_INLINE.sub(',', text)
+    return text
+
+
+# Matches two bare alphanumeric tokens separated by commas/hyphens (± spaces) or plain spaces.
+_ALNUM_MERGE_RE = re.compile(r'([A-Za-z0-9]+)([,\-]\s*|\s+)([A-Za-z0-9]+)')
+
+
+def _is_code_token(token: str, strict: bool = False) -> bool:
+    """True if the token looks like a code/identifier component rather than an English word.
+
+    strict=True (space-only separator) requires a digit or single char.
+    strict=False (comma/hyphen separator) also accepts short all-caps strings.
+    """
+    if any(c.isdigit() for c in token):
+        return True
+    if len(token) == 1:
+        return True
+    if not strict and token.isupper() and len(token) <= 4:
+        return True
+    return False
+
+
+def _merge_adjacent_alphanumeric(text: str) -> str:
+    """Merge adjacent alphanumeric tokens separated by commas, hyphens, or spaces when both
+    look like code/identifier components rather than natural-language words.
+
+    Applied iteratively until no more merges are possible, so chains like
+    "A, B, C, 1, 2, 3" fully collapse to "ABC123".
+    """
+    def replacer(m: re.Match) -> str:
+        left, sep, right = m.group(1), m.group(2), m.group(3)
+        # Space-only separators use stricter criteria to avoid merging e.g. "5 PM"
+        strict = ',' not in sep and '-' not in sep
+        if _is_code_token(left, strict) and _is_code_token(right, strict):
+            return left + right
+        return m.group(0)
+
+    prev = None
+    while prev != text:
+        prev = text
+        text = _ALNUM_MERGE_RE.sub(replacer, text)
     return text
 
 
@@ -106,24 +157,37 @@ def transcribe_api(audio_data):
     model_options = ConfigManager.get_config_section('model_options')
     # Prefer GROQ_API_KEY; fall back to OPENAI_API_KEY for vanilla OpenAI usage
     api_key = os.getenv('GROQ_API_KEY') or os.getenv('OPENAI_API_KEY') or None
-    client = OpenAI(
-        api_key=api_key,
-        base_url=model_options['api']['base_url'] or 'https://api.openai.com/v1',
-    )
 
-    byte_io = io.BytesIO()
-    sample_rate = ConfigManager.get_config_section('recording_options').get('sample_rate') or 16000
-    sf.write(byte_io, audio_data, sample_rate, format='wav')
-    byte_io.seek(0)
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=model_options['api']['base_url'] or 'https://api.openai.com/v1',
+        )
 
-    response = client.audio.transcriptions.create(
-        model=model_options['api']['model'],
-        file=('audio.wav', byte_io, 'audio/wav'),
-        language=model_options['common']['language'],
-        prompt=model_options['common']['initial_prompt'],
-        temperature=model_options['common']['temperature'],
-    )
-    return response.text
+        byte_io = io.BytesIO()
+        sample_rate = ConfigManager.get_config_section('recording_options').get('sample_rate') or 16000
+        sf.write(byte_io, audio_data, sample_rate, format='wav')
+        byte_io.seek(0)
+
+        response = client.audio.transcriptions.create(
+            model=model_options['api']['model'],
+            file=('audio.wav', byte_io, 'audio/wav'),
+            language=model_options['common']['language'],
+            prompt=model_options['common']['initial_prompt'],
+            temperature=model_options['common']['temperature'],
+        )
+    except Exception as e:
+        cls = type(e).__name__
+        msg = str(e) or repr(e)
+        signal = (cls + ' ' + msg).lower()
+        if any(k in signal for k in ('connection', 'timeout', 'dns', 'unreachable', 'getaddrinfo', 'network', 'temporary failure')):
+            raise TranscriptionAPIError(f'No internet connection ({cls})') from e
+        raise TranscriptionAPIError(f'API error ({cls}): {msg}') from e
+
+    text = response.text or ''
+    if not text.strip():
+        raise TranscriptionAPIError('Empty response from transcription API')
+    return text
 
 
 def llm_polish(transcription):
@@ -205,6 +269,7 @@ def post_process_transcription(transcription):
 
     # LLM polish runs on the raw stripped transcript, before whitespace/case tweaks
     transcription = llm_polish(transcription)
+    transcription = _merge_adjacent_alphanumeric(transcription)
 
     post_processing = ConfigManager.get_config_section('post_processing')
     if post_processing['remove_trailing_period'] and transcription.endswith('.'):
