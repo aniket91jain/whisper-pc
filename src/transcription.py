@@ -6,6 +6,7 @@ import soundfile as sf
 from openai import OpenAI
 
 from utils import ConfigManager
+from engine.polish.post_llm_repair import apply as apply_post_llm_repair
 
 
 class TranscriptionAPIError(Exception):
@@ -376,6 +377,16 @@ def llm_polish(transcription):
             api_key=api_key,
             base_url=config.get('base_url') or 'https://api.groq.com/openai/v1',
         )
+        # gpt-oss-* family is a reasoning model on Groq; without reasoning_effort
+        # it burns tokens on chain-of-thought and runs slower. 'low' is enough
+        # for the mechanical polish task — verified empirically (Section 7 of
+        # whisper-polish-deep-dive.md): output tokens dropped ~60% with no
+        # quality loss. Llama models on Groq don't accept the param, so pass
+        # it only for gpt-oss-*.
+        extra_kwargs = {}
+        model_name = config.get('model') or ''
+        if model_name.startswith('openai/gpt-oss'):
+            extra_kwargs['reasoning_effort'] = config.get('reasoning_effort') or 'low'
         response = client.chat.completions.create(
             model=config['model'],
             max_tokens=config.get('max_tokens') or 1024,
@@ -384,6 +395,7 @@ def llm_polish(transcription):
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': f'[TRANSCRIPT]\n{transcription}\n[/TRANSCRIPT]'},
             ],
+            **extra_kwargs,
         )
         polished = response.choices[0].message.content
         ConfigManager.console_print(f'LLM polish: raw="{transcription.strip()}" → polished="{polished}"')
@@ -397,32 +409,19 @@ def llm_polish(transcription):
         except Exception:
             pass
 
-        # Strip accidental [TRANSCRIPT] / [/TRANSCRIPT] tags the model may echo
-        polished = polished.replace('[TRANSCRIPT]', '').replace('[/TRANSCRIPT]', '').strip()
-
-        # Safety net: intercept old sentinel if model still produces it
-        if polished == 'NOTHING TO POLISH':
-            ConfigManager.console_print('LLM polish: sentinel intercepted — returning raw.')
+        # Delegate post-LLM safety checks to the shared repair module so
+        # Mobile + PC stay in lockstep. The module strips wrapper tags,
+        # <thinking>/<reasoning>/<analysis> blocks, surrounding quotes, and
+        # leading preambles; recognises the __EMPTY__ sentinel from the v3b
+        # prompt; and rejects via Levenshtein-ratio + word-overlap + bad-
+        # first-token checks. On rejection it returns the raw transcript.
+        repair = apply_post_llm_repair(transcription, polished)
+        if repair.polish_rejected:
+            ConfigManager.console_print(
+                f'LLM polish rejected ({repair.rejection_reason}); returning raw.'
+            )
             return transcription
-
-        # Safety net: if LLM wiped all content but input was non-empty, fall back to raw
-        if not polished and transcription.strip():
-            ConfigManager.console_print('LLM polish: empty output on non-empty input — returning raw.')
-            return transcription
-
-        # Safety net: catch wholesale hallucination (< 30% of output words appear in input)
-        if len(transcription.strip()) > 20:
-            overlap = _word_overlap_ratio(transcription, polished)
-            if overlap < 0.30:
-                ConfigManager.console_print(f'LLM polish: low word overlap ({overlap:.0%}) — likely hallucination, returning raw.')
-                return transcription
-
-        # Length guard as final catch-all
-        if len(transcription.strip()) > 10 and len(polished) > len(transcription.strip()) * 3:
-            ConfigManager.console_print('LLM polish: output 3x longer than input — returning raw.')
-            return transcription
-
-        return polished
+        return repair.final_text
     except Exception as e:
         ConfigManager.console_print(f'LLM polish error (returning raw transcription): {e}')
         return transcription
