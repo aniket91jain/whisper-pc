@@ -25,7 +25,12 @@ class WhisperPCApp(QObject):
         """
         super().__init__()
         self.app = QApplication(sys.argv)
-        self.app.setWindowIcon(QIcon(os.path.join('assets', 'ww-logo.png')))
+        # Use Whisper PC branding for Windows UI surfaces (taskbar, Alt-Tab,
+        # dialog title bars, JumpList, etc.). setApplicationName feeds the
+        # display name; setWindowIcon supplies the icon at every level.
+        self.app.setApplicationName('Whisper PC')
+        self.app.setApplicationDisplayName('Whisper PC')
+        self.app.setWindowIcon(QIcon(os.path.join('assets', 'microphone.png')))
 
         ConfigManager.initialize()
 
@@ -86,6 +91,7 @@ class WhisperPCApp(QObject):
         # Mic icon matches Mobile's tray glyph and gives the system tray a
         # functional read (this is a dictation app) instead of the W logo.
         self.tray_icon = QSystemTrayIcon(QIcon(os.path.join('assets', 'microphone.png')), self.app)
+        self.tray_icon.setToolTip('Whisper PC')
 
         tray_menu = QMenu()
 
