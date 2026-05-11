@@ -56,6 +56,9 @@ class InputSimulator:
         'MozillaWindowClass',            # Firefox
         'Notepad',                       # Windows Notepad
         'ConsoleWindowClass',            # Windows Terminal / cmd
+        '_WwG',                          # Word document body
+        'EXCEL7',                        # Excel cell-edit pane
+        'paneClassDC',                   # PowerPoint slide pane
     }
 
     # Native classes whose cursor position can be queried via Win32 messages
@@ -66,6 +69,25 @@ class InputSimulator:
         'RichEdit20W', 'RichEdit20A', 'RICHEDIT50W',
         'Scintilla',
         'Notepad',
+    }
+
+    # Top-level classes for Office apps that activate ribbon KeyTip mode on
+    # bare Alt press. When the activation chord includes Alt (e.g. alt+z),
+    # Word/Excel/PPT respond to the Alt-down by parking the document caret
+    # and routing focus to a NetUIHWND ribbon control. We detect that state
+    # at paste-time and send Esc to dismiss it.
+    _OFFICE_TOPLEVEL_CLASSES = {
+        'OpusApp',          # Word
+        'XLMAIN',           # Excel
+        'PPTFrameClass',    # PowerPoint
+    }
+
+    # Office "document body" focus classes. If the focused control belongs
+    # to one of these, the ribbon is NOT active and Esc would be wasted.
+    _OFFICE_BODY_CLASSES = {
+        '_WwG',             # Word
+        'EXCEL7',           # Excel
+        'paneClassDC',      # PowerPoint
     }
 
     def __init__(self):
@@ -291,14 +313,16 @@ class InputSimulator:
             return text
         return text[0].lower() + text[1:]
 
-    def _typewrite_sendinput(self, text):
-        """Send entire text in one batched Windows SendInput call (instantaneous)."""
-        INPUT_KEYBOARD    = 1
-        KEYEVENTF_UNICODE = 0x0004
-        KEYEVENTF_KEYUP   = 0x0002
-        ULONG_PTR         = ctypes.c_void_p  # 8 bytes on 64-bit; None → null pointer
+    # Cached SendInput plumbing (lazily built once on first use).
+    _SI_TYPES = None
 
-        class MOUSEINPUT(ctypes.Structure):  # must be in union to give union correct size (32 B)
+    @classmethod
+    def _sendinput_types(cls):
+        if cls._SI_TYPES is not None:
+            return cls._SI_TYPES
+        ULONG_PTR = ctypes.c_void_p
+
+        class MOUSEINPUT(ctypes.Structure):
             _fields_ = [('dx', ctypes.c_long), ('dy', ctypes.c_long),
                         ('mouseData', ctypes.c_ulong), ('dwFlags', ctypes.c_ulong),
                         ('time', ctypes.c_ulong), ('dwExtraInfo', ULONG_PTR)]
@@ -318,20 +342,124 @@ class InputSimulator:
         class INPUT(ctypes.Structure):
             _fields_ = [('type', ctypes.wintypes.DWORD), ('union', _INPUT_UNION)]
 
-        # Encode as UTF-16LE so chars outside the BMP become proper surrogate pairs
-        raw = text.encode('utf-16-le')
-        inputs = []
-        for i in range(0, len(raw), 2):
-            scan = raw[i] | (raw[i + 1] << 8)
-            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
-                ki = KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=None)
-                inputs.append(INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=ki)))
+        cls._SI_TYPES = (INPUT, _INPUT_UNION, KEYBDINPUT)
+        return cls._SI_TYPES
 
-        n = len(inputs)
-        if n:
-            ctypes.windll.user32.SendInput(n, (INPUT * n)(*inputs), ctypes.sizeof(INPUT))
+    @classmethod
+    def _send_ctrl_v(cls):
+        """Send Ctrl+V via Win32 SendInput, after lifting any sticky modifiers.
+
+        Using SendInput directly (instead of pynput's Controller) sidesteps a
+        Word-specific failure mode: Word treats Alt+Ctrl+V as "Paste Special"
+        rather than paste, so if the user is still holding the activation
+        chord (alt+z) — or the OS thinks they are — pynput's Ctrl+V opens the
+        Paste Special dialog and inserts nothing. We pre-emptively send key-up
+        events for Alt/Shift before pressing Ctrl+V to guarantee a clean
+        accelerator. Releasing an already-up key is a no-op, so this is safe
+        regardless of actual hand state.
+        """
+        INPUT, _INPUT_UNION, KEYBDINPUT = cls._sendinput_types()
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+
+        VK_LMENU = 0xA4   # Left Alt
+        VK_RMENU = 0xA5   # Right Alt
+        VK_LSHIFT = 0xA0
+        VK_RSHIFT = 0xA1
+        VK_CONTROL = 0x11
+        VK_V = 0x56
+
+        def ki(vk, up=False):
+            flags = KEYEVENTF_KEYUP if up else 0
+            return INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=KEYBDINPUT(
+                wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)))
+
+        # Defensive: lift any modifier the user might still be holding from the
+        # activation chord. Without this, Alt+Ctrl+V in Word = "Paste Special",
+        # not paste.
+        cleanup = [
+            ki(VK_LMENU, up=True),
+            ki(VK_RMENU, up=True),
+            ki(VK_LSHIFT, up=True),
+            ki(VK_RSHIFT, up=True),
+        ]
+        n = len(cleanup)
+        ctypes.windll.user32.SendInput(n, (INPUT * n)(*cleanup), ctypes.sizeof(INPUT))
+        time.sleep(0.02)
+
+        paste = [
+            ki(VK_CONTROL),
+            ki(VK_V),
+            ki(VK_V, up=True),
+            ki(VK_CONTROL, up=True),
+        ]
+        n = len(paste)
+        ctypes.windll.user32.SendInput(n, (INPUT * n)(*paste), ctypes.sizeof(INPUT))
+
+    @classmethod
+    def _send_esc(cls):
+        """Send a clean Esc keystroke via SendInput, after lifting any sticky
+        Alt the activation chord may have left virtually held. Used to dismiss
+        Office's ribbon KeyTip mode before pasting."""
+        INPUT, _INPUT_UNION, KEYBDINPUT = cls._sendinput_types()
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+        VK_LMENU = 0xA4
+        VK_RMENU = 0xA5
+        VK_ESCAPE = 0x1B
+
+        def ki(vk, up=False):
+            flags = KEYEVENTF_KEYUP if up else 0
+            return INPUT(INPUT_KEYBOARD, _INPUT_UNION(ki=KEYBDINPUT(
+                wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)))
+
+        cleanup = [ki(VK_LMENU, up=True), ki(VK_RMENU, up=True)]
+        n = len(cleanup)
+        ctypes.windll.user32.SendInput(n, (INPUT * n)(*cleanup), ctypes.sizeof(INPUT))
+        seq = [ki(VK_ESCAPE), ki(VK_ESCAPE, up=True)]
+        n = len(seq)
+        ctypes.windll.user32.SendInput(n, (INPUT * n)(*seq), ctypes.sizeof(INPUT))
+
+    def _dismiss_office_ribbon_if_active(self):
+        """Office (Word/Excel/PPT) activates ribbon KeyTip mode on bare Alt
+        press. With activation_key=alt+z, the user's Alt-down is observed by
+        Office before pynput's listener fires, so by the time we paste, focus
+        sits on a NetUIHWND ribbon control instead of the document body —
+        Ctrl+V then either misses the doc or fires the wrong accelerator.
+
+        Detect the state (foreground is Office, focus is NOT a body class)
+        and send Esc to dismiss. Esc in the document body is a no-op, so the
+        check is defensive — if the user happens to be paste-targeting Word
+        with the doc body already focused, we don't disturb it.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            top_hwnd = user32.GetForegroundWindow()
+            if not top_hwnd:
+                return
+            top_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(top_hwnd, top_buf, 256)
+            if top_buf.value not in self._OFFICE_TOPLEVEL_CLASSES:
+                return
+            focus = self._foreground_focus()
+            if focus is not None and focus[1] in self._OFFICE_BODY_CLASSES:
+                return
+            ConfigManager.console_print(
+                f'Office ribbon detected (top={top_buf.value!r}, '
+                f'focus={focus[1] if focus else None!r}); sending Esc.'
+            )
+            self._send_esc()
+            time.sleep(0.05)
+        except Exception:
+            pass
 
     def _typewrite_clipboard(self, text):
+        # If foreground is an Office app whose ribbon got activated by the
+        # Alt in the activation chord, dismiss it before we read the focus
+        # so the rest of the function sees the document body, not a ribbon
+        # control. No-op for non-Office apps.
+        self._dismiss_office_ribbon_if_active()
+
         focus = self._foreground_focus()
         if focus is None:
             # No foreground window / focus at all - leave in clipboard for manual paste.
@@ -340,6 +468,10 @@ class InputSimulator:
 
         focus_hwnd, class_name = focus
         is_known_text = class_name in self._TEXT_INPUT_CLASSES
+        ConfigManager.console_print(
+            f'Paste target: hwnd=0x{focus_hwnd:X} class={class_name!r} '
+            f'known_text={is_known_text}'
+        )
 
         if is_known_text:
             want_space = ConfigManager.get_config_value(
@@ -365,10 +497,15 @@ class InputSimulator:
             saved = ''
         pyperclip.copy(text)
         time.sleep(0.05)
-        with self.keyboard.pressed(Key.ctrl):
-            self.keyboard.press('v')
-            self.keyboard.release('v')
-        time.sleep(0.1)
+        # SendInput with explicit Alt/Shift release first — pynput's Ctrl+V
+        # was opening Word's Paste Special dialog when the activation chord's
+        # Alt was still virtually down. Direct SendInput also routes through
+        # Word's accelerator handling more reliably.
+        self._send_ctrl_v()
+        # Wait long enough for Word's clipboard reader to consume the data
+        # before we restore the previous clipboard contents. 100ms wasn't
+        # enough on Word with its rich-paste pipeline; 300ms covers it.
+        time.sleep(0.3)
         try:
             pyperclip.copy(saved)
         except Exception:
