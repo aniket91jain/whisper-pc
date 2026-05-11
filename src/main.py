@@ -54,6 +54,7 @@ class WhisperWriterApp(QObject):
         self.local_model = create_local_model() if not model_options.get('use_api') else None
 
         self.result_thread = None
+        self._recording_started_at = 0.0
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._log_path = os.path.join(project_root, 'transcript_log.txt')
         self._failed_log_path = os.path.join(project_root, 'failed_log.txt')
@@ -146,6 +147,11 @@ class WhisperWriterApp(QObject):
             )
             self.initialize_components()
 
+    # Ignore a second activation-chord fire within this window after recording
+    # starts. Guards against accidental retriggers (held Alt + stray Z, OS
+    # key-repeat, AltGr layouts) cutting the user off mid-sentence.
+    _TOGGLE_COOLDOWN_SEC = 0.5
+
     def on_activation(self):
         """
         Called when the activation key combination is pressed.
@@ -153,6 +159,13 @@ class WhisperWriterApp(QObject):
         if self.result_thread and self.result_thread.isRunning():
             recording_mode = ConfigManager.get_config_value('recording_options', 'recording_mode')
             if recording_mode == 'press_to_toggle':
+                elapsed = time.time() - self._recording_started_at
+                if elapsed < self._TOGGLE_COOLDOWN_SEC:
+                    ConfigManager.console_print(
+                        f'Toggle ignored (cooldown): {elapsed*1000:.0f}ms < '
+                        f'{self._TOGGLE_COOLDOWN_SEC*1000:.0f}ms since recording started.'
+                    )
+                    return
                 self.result_thread.stop_recording()
             elif recording_mode == 'continuous':
                 self.stop_result_thread()
@@ -181,6 +194,7 @@ class WhisperWriterApp(QObject):
             self.status_window.closeSignal.connect(self.stop_result_thread)
         self.result_thread.resultSignal.connect(self.on_transcription_complete)
         self.result_thread.failedSignal.connect(self.on_transcription_failed)
+        self._recording_started_at = time.time()
         self.result_thread.start()
 
     def stop_result_thread(self):
