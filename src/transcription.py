@@ -35,16 +35,182 @@ _WHISPER_HALLUCINATIONS = frozenset({
     "sous-titres réalisés para la communauté d'amara.org",
 })
 
+# Distinctive hallucination strings that are safe to substring-match — these
+# never appear in real user speech, so dropping anything that contains them is
+# fine. Generic phrases like "thank you" stay exact-match only (the trailing-
+# strip below handles the common "real text + trailing thanks" case).
+_WHISPER_HALLUCINATION_SUBSTRINGS = (
+    'subtitles by the amara.org community',
+    "sous-titres réalisés para la communauté d'amara.org",
+    'société radio-canada',
+    'société radio canada',
+    '[silence]',
+    '[ silence ]',
+)
 
-# Whisper double-insert: model inserts punctuation comma AND keeps spoken word "comma"
-_SPOKEN_COMMA_DOUBLE = re.compile(r',\s*comma\s*,', re.IGNORECASE)
-# Inline spoken command: "word comma word" with no surrounding commas
-_SPOKEN_COMMA_INLINE = re.compile(r'(?<=\w)\s+comma(?=\s+\w)', re.IGNORECASE)
+# Whisper hallucinates in random non-English scripts when fed silence/noise
+# (Cyrillic, Arabic, CJK, Devanagari, Korean, Japanese, Hebrew, Thai), and in
+# Turkish-specific Latin letters (ş ğ İ ı). Config sets language=en, so any
+# character from these ranges in the output is almost certainly a hallucination.
+# Common European accented letters (é, ü, ç, ñ, etc.) are intentionally NOT
+# included — they appear in legitimate proper nouns and loanwords.
+_NON_ENGLISH_SCRIPT_RE = re.compile(
+    '['
+    'Ѐ-ӿ'   # Cyrillic
+    'Ԁ-ԯ'   # Cyrillic Supplement
+    '֐-׿'   # Hebrew
+    '؀-ۿ'   # Arabic
+    '܀-ݏ'   # Syriac
+    'ऀ-ॿ'   # Devanagari
+    'ঀ-৿'   # Bengali
+    '฀-๿'   # Thai
+    '぀-ゟ'   # Hiragana
+    '゠-ヿ'   # Katakana
+    '㐀-䶿'   # CJK Unified Ideographs Extension A
+    '一-鿿'   # CJK Unified Ideographs
+    '가-힯'   # Hangul
+    'şŞğĞıİ'  # Turkish-specific: ş Ş ğ Ğ ı İ
+    ']'
+)
+
+
+# Spoken-punctuation dictation table. Each tuple is
+#   (phrase_regex, symbol, side, safe_inline)
+#
+# `side` controls inline-replacement spacing:
+#   'L' = opening punctuation ([({") — keep leading whitespace, drop trailing
+#   'R' = closing/sentence-ending punctuation (.,;:!?]}) — drop leading, keep trailing
+#   'B' = bidirectional inline glyph (/ \ @ # = * - ...) — drop both spaces
+#
+# `safe_inline` gates the inline + end-of-utterance patterns. False means the
+# spoken word is too often legitimate content (e.g. "period of rest") to risk
+# replacing in those positions; the LLM SYMBOLS rule handles those cases.
+# The Whisper double-render pattern (symbol on both sides of the word) fires
+# regardless — it's near-zero false-positive because Whisper would never
+# spontaneously produce ". period." or ", colon," around legitimate content.
+#
+# Order matters: longer/more-specific phrases first so "exclamation mark"
+# wins over a hypothetical "exclamation", and "open parenthesis" wins over
+# "open paren".
+_SPOKEN_PUNCT = [
+    (r"new\s+paragraph",                            "[blank line]", "B", True),
+    (r"new\s+line",                                 "[newline]",    "B", True),
+    (r"exclamation\s+(?:mark|point)",               "!",            "R", True),
+    (r"question\s+mark",                            "?",            "R", True),
+    (r"open\s+parenthesis|open\s+paren",            "(",            "L", True),
+    (r"close\s+parenthesis|close\s+paren",          ")",            "R", True),
+    (r"open\s+bracket",                             "[",            "L", True),
+    (r"close\s+bracket",                            "]",            "R", True),
+    (r"open\s+curly(?:\s+brace)?|open\s+brace",     "{",            "L", True),
+    (r"close\s+curly(?:\s+brace)?|close\s+brace",   "}",            "R", True),
+    (r"end\s+quote",                                '"',            "R", True),
+    (r"semi[\s-]?colon",                            ";",            "R", True),
+    (r"forward\s+slash",                            "/",            "B", True),
+    (r"back[\s-]?slash",                            "\\",           "B", True),
+    (r"at\s+(?:sign|symbol)",                       "@",            "B", True),
+    (r"hash\s+(?:sign|tag)|hashtag",                "#",            "B", True),
+    (r"equals\s+sign",                              "=",            "B", True),
+    (r"ellipsis",                                   "...",          "R", True),
+    (r"asterisk",                                   "*",            "B", True),
+    (r"hyphen",                                     "-",            "B", True),
+    (r"comma",                                      ",",            "R", True),
+    (r"full[\s-]?stop",                             ".",            "R", True),
+    # Risky inline matches — these spoken words are commonly legitimate content
+    # ("period of rest", "made a dash", "colon cancer"). Only fire on a Whisper
+    # double-render, which Whisper would never produce around real content.
+    (r"period",                                     ".",            "R", False),
+    (r"colon",                                      ":",            "R", False),
+    (r"dash",                                       "-",            "B", False),
+    (r"slash",                                      "/",            "B", False),
+    (r"hash",                                       "#",            "B", False),
+    (r"equals",                                     "=",            "B", False),
+    (r"quote",                                      '"',            "L", False),
+    (r"star",                                       "*",            "B", False),
+]
 
 
 def _normalize_spoken_symbols(text: str) -> str:
-    text = _SPOKEN_COMMA_DOUBLE.sub(',', text)
-    text = _SPOKEN_COMMA_INLINE.sub(',', text)
+    """Convert spoken punctuation commands to their symbols when surrounding
+    context indicates the word is a dictation command rather than content.
+
+    Three patterns fire for safe phrases:
+      1. Whisper double-render: ``<sym><phrase><sym>`` → ``<sym>``
+         (model inserted both the symbol and the spoken word around it).
+      2. Inline mid-sentence: ``<word> <phrase> <word>`` → ``<word><sym><word>``
+         (clear command position, between content words).
+      3. End-of-utterance: ``<word> <phrase>[. ! ?]?$`` → ``<word><sym>``
+         (final word, optionally followed by Whisper's auto terminator).
+
+    For risky phrases (period, colon, dash, etc. — commonly content words)
+    only pattern 1 fires; the LLM SYMBOLS rule cleans up the rest.
+
+    Patterns require word boundaries plus ``\\s+`` separators around the
+    phrase, so embedded usages ("uncommon", "full-stopping") are safe.
+    """
+    # Use callable replacements throughout: replacement strings interpret \1,
+    # \\, and similar backreferences, which collides with symbols like \ or
+    # tokens like [newline].
+    for phrase, sym, side, safe in _SPOKEN_PUNCT:
+        sym_esc = re.escape(sym)
+        phrase_grouped = f"(?:{phrase})"
+
+        # 1. Whisper double-render. Always safe — Whisper does not surround
+        #    legitimate content with redundant punctuation.
+        text = re.sub(
+            rf'{sym_esc}\s*\b{phrase_grouped}\b\s*{sym_esc}',
+            lambda m, s=sym: s,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not safe:
+            continue
+
+        if side == "L":
+            # Inline: keep leading space, drop trailing: "x open paren y" → "x (y"
+            text = re.sub(
+                rf'(?<=\w)(\s+)\b{phrase_grouped}\b\s+(?=\w)',
+                lambda m, s=sym: m.group(1) + s,
+                text,
+                flags=re.IGNORECASE,
+            )
+            # Start-of-utterance: "open bracket 5 ..." → "[5 ..."
+            text = re.sub(
+                rf'^\s*\b{phrase_grouped}\b\s+(?=\w)',
+                lambda m, s=sym: s,
+                text,
+                flags=re.IGNORECASE,
+            )
+        elif side == "R":
+            # Drop leading space, keep trailing space: "x comma y" → "x, y"
+            text = re.sub(
+                rf'(?<=\w)\s+\b{phrase_grouped}\b(?=\s+\w)',
+                lambda m, s=sym: s,
+                text,
+                flags=re.IGNORECASE,
+            )
+            # End-of-utterance, optional Whisper-inserted terminator absorbed.
+            text = re.sub(
+                rf'(?<=\w)\s+\b{phrase_grouped}\b\s*[.!?]?\s*$',
+                lambda m, s=sym: s,
+                text,
+                flags=re.IGNORECASE,
+            )
+        else:  # 'B'
+            # Drop both spaces: "x hash y" → "x#y"
+            text = re.sub(
+                rf'(?<=\w)\s+\b{phrase_grouped}\b\s+(?=\w)',
+                lambda m, s=sym: s,
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = re.sub(
+                rf'(?<=\w)\s+\b{phrase_grouped}\b\s*$',
+                lambda m, s=sym: s,
+                text,
+                flags=re.IGNORECASE,
+            )
+
     return text
 
 
@@ -293,6 +459,16 @@ def transcribe(audio_data, local_model=None):
         ConfigManager.console_print(f'Audio signal absent (RMS={rms:.0f}), skipping transcription.')
         return ''
 
+    # Short + quiet clips are the prime hallucination zone: Whisper invents
+    # words from <1s of low-energy audio. Drop before the API call.
+    sample_rate = ConfigManager.get_config_value('recording_options', 'sample_rate') or 16000
+    duration = len(audio_data) / sample_rate
+    if duration < 0.8 and rms < 200:
+        ConfigManager.console_print(
+            f'Audio too short and quiet ({duration:.2f}s, RMS={rms:.0f}); skipping transcription.'
+        )
+        return ''
+
     if ConfigManager.get_config_value('model_options', 'use_api'):
         transcription = transcribe_api(audio_data)
     else:
@@ -300,9 +476,25 @@ def transcribe(audio_data, local_model=None):
 
     ConfigManager.console_print(f'Whisper output: "{transcription.strip()}"')
 
+    stripped_lower = transcription.strip().lower()
+
     # Discard known Whisper hallucinations produced on silence.
-    if transcription.strip().lower() in _WHISPER_HALLUCINATIONS:
-        ConfigManager.console_print(f'Whisper hallucination discarded: "{transcription.strip()}"')
+    if stripped_lower in _WHISPER_HALLUCINATIONS:
+        ConfigManager.console_print(f'Whisper hallucination discarded (exact): "{transcription.strip()}"')
+        return ''
+
+    # Distinctive hallucination phrases (Amara, Société Radio-Canada, [silence])
+    # never appear in real speech — drop on substring match.
+    for needle in _WHISPER_HALLUCINATION_SUBSTRINGS:
+        if needle in stripped_lower:
+            ConfigManager.console_print(f'Whisper hallucination discarded (substring "{needle}"): "{transcription.strip()}"')
+            return ''
+
+    # Non-English script in the output (Cyrillic, Arabic, CJK, Turkish-specific
+    # Latin, etc.) when language is configured as English — Whisper hallucinated.
+    language = ConfigManager.get_config_value('model_options', 'common', 'language')
+    if language == 'en' and _NON_ENGLISH_SCRIPT_RE.search(transcription):
+        ConfigManager.console_print(f'Whisper hallucination discarded (non-English script): "{transcription.strip()}"')
         return ''
 
     # Strip trailing "Thank you" appended by Whisper at the end of real transcriptions.
