@@ -21,6 +21,10 @@ class BaseWindow(QMainWindow):
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        # Keep the overlay from stealing focus when shown — without this Qt
+        # tool windows can briefly activate on Windows, giving Word et al. a
+        # spurious focus-out event mid-recording.
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setFixedSize(width, height)
 
         self.main_widget = QWidget(self)
