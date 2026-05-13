@@ -281,11 +281,20 @@ class KeyListener:
         self.backends = []
         self.active_backend = None
         self.key_chord = None
+        self.history_chord = None
+        # Tracks whether the most recent activation transition was actually
+        # delivered to listeners. Used to avoid firing on_deactivate after an
+        # on_activate that we suppressed due to a longer chord (history) also
+        # satisfying the shorter activation chord — e.g. activation=Alt+Z,
+        # history=Alt+Shift+Z.
+        self._activation_acknowledged = False
         self.callbacks = {
             "on_activate": [],
-            "on_deactivate": []
+            "on_deactivate": [],
+            "on_history_activate": []
         }
         self.load_activation_keys()
+        self.load_history_keys()
         self.initialize_backends()
         self.select_backend_from_config()
 
@@ -383,20 +392,54 @@ class KeyListener:
         """Set the activation keys for the KeyChord."""
         self.key_chord = KeyChord(keys)
 
+    def load_history_keys(self):
+        """Load history-popup hotkey from configuration. Blank = disabled."""
+        combo = ConfigManager.get_config_value('recording_options', 'history_key')
+        if not combo or not combo.strip():
+            self.history_chord = None
+            return
+        keys = self.parse_key_combination(combo)
+        self.history_chord = KeyChord(keys) if keys else None
+
+    def update_history_keys(self):
+        """Reload the history hotkey after settings changes."""
+        self.load_history_keys()
+
     def on_input_event(self, event):
         """Handle input events and trigger callbacks if the key chord becomes active or inactive."""
-        if not self.key_chord or not self.active_backend:
+        if not self.active_backend:
             return
 
         key, event_type = event
 
-        was_active = self.key_chord.is_active()
-        is_active = self.key_chord.update(key, event_type)
+        # Evaluate history first so we can suppress an activation that would
+        # otherwise fire on the same input event when chords overlap (e.g.
+        # activation=Alt+Z, history=Alt+Shift+Z share Alt and Z).
+        history_fired = False
+        if self.history_chord:
+            was_active = self.history_chord.is_active()
+            is_active = self.history_chord.update(key, event_type)
+            if not was_active and is_active:
+                history_fired = True
+                self._trigger_callbacks("on_history_activate")
 
-        if not was_active and is_active:
-            self._trigger_callbacks("on_activate")
-        elif was_active and not is_active:
-            self._trigger_callbacks("on_deactivate")
+        if self.key_chord:
+            was_active = self.key_chord.is_active()
+            is_active = self.key_chord.update(key, event_type)
+
+            if not was_active and is_active:
+                if history_fired:
+                    # Skip — the user pressed the longer history combo. Leave
+                    # _activation_acknowledged False so the matching release
+                    # won't fire on_deactivate either.
+                    pass
+                else:
+                    self._trigger_callbacks("on_activate")
+                    self._activation_acknowledged = True
+            elif was_active and not is_active:
+                if self._activation_acknowledged:
+                    self._trigger_callbacks("on_deactivate")
+                self._activation_acknowledged = False
 
     def add_callback(self, event: str, callback: Callable):
         """Add a callback function for a specific event."""
@@ -793,6 +836,16 @@ class PynputBackend(InputBackend):
     def _translate_key_event(self, native_event) -> tuple[KeyCode, InputEvent]:
         """Translate a pynput event to our internal event representation."""
         pynput_key, is_press = native_event
+        # Normalise Shift+letter (and CapsLock+letter): pynput emits the
+        # uppercase character KeyCode in that case, but key_map only has the
+        # lowercase entries — without this, chords like Alt+Shift+Z never
+        # match because the 'Z' event falls through to the default.
+        try:
+            ch = getattr(pynput_key, 'char', None)
+            if ch and len(ch) == 1 and ch.isalpha() and ch.isupper():
+                pynput_key = self.keyboard.KeyCode.from_char(ch.lower())
+        except Exception:
+            pass
         key_code = self.key_map.get(pynput_key, KeyCode.SPACE)
         event_type = InputEvent.KEY_PRESS if is_press else InputEvent.KEY_RELEASE
         return key_code, event_type

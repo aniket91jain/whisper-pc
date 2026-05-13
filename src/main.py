@@ -4,7 +4,7 @@ import time
 from audioplayer import AudioPlayer
 from pynput.keyboard import Controller
 from PyQt5.QtCore import QObject, QProcess
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QCursor, QGuiApplication
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 
 from key_listener import KeyListener
@@ -53,6 +53,7 @@ class WhisperPCApp(QObject):
         self.key_listener = KeyListener()
         self.key_listener.add_callback("on_activate", self.on_activation)
         self.key_listener.add_callback("on_deactivate", self.on_deactivation)
+        self.key_listener.add_callback("on_history_activate", self.on_history_hotkey)
 
         model_options = ConfigManager.get_config_section('model_options')
         model_path = model_options.get('local', {}).get('model_path')
@@ -125,7 +126,7 @@ class WhisperPCApp(QObject):
         if self.input_simulator:
             self.input_simulator.cleanup()
 
-    def _open_transcript_log(self):
+    def _open_transcript_log(self, near_cursor=False):
         if self._history_window is None:
             self._history_window = TranscriptHistoryWindow(
                 self._log_path,
@@ -135,8 +136,31 @@ class WhisperPCApp(QObject):
             )
         else:
             self._history_window._load()
+        if near_cursor:
+            self._position_window_near_cursor(self._history_window)
         self._history_window.show()
         self._history_window.raise_()
+
+    def _position_window_near_cursor(self, window):
+        """Place the window's top-left a bit below-right of the mouse pointer,
+        clamped to the current screen so it never opens off-screen on multi-mon
+        setups."""
+        cursor_pos = QCursor.pos()
+        screen = QGuiApplication.screenAt(cursor_pos) or QGuiApplication.primaryScreen()
+        screen_geo = screen.availableGeometry()
+        w, h = window.width(), window.height()
+        x = min(max(cursor_pos.x() + 12, screen_geo.left()), screen_geo.right() - w)
+        y = min(max(cursor_pos.y() + 12, screen_geo.top()), screen_geo.bottom() - h)
+        window.move(x, y)
+
+    def on_history_hotkey(self):
+        """Ditto-style toggle: hotkey opens the history popup near the cursor,
+        or hides it if already visible. Window keeps focus on the underlying
+        app so a click on a card pastes into the active field."""
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.hide()
+            return
+        self._open_transcript_log(near_cursor=True)
 
     def exit_app(self):
         """
