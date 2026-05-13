@@ -7,6 +7,7 @@ from openai import OpenAI
 
 from utils import ConfigManager
 from engine.polish.post_llm_repair import apply as apply_post_llm_repair
+from engine.polish.proper_nouns_renderer import substitute as substitute_proper_nouns
 
 
 # Cache of OpenAI SDK clients keyed by base_url. The SDK uses httpx with
@@ -404,6 +405,8 @@ def llm_polish(transcription):
     if not system_prompt:
         ConfigManager.console_print('LLM polish skipped: no system_prompt configured.')
         return transcription
+
+    system_prompt = substitute_proper_nouns(system_prompt, config.get('proper_nouns'))
 
     try:
         client = get_openai_client(config.get('base_url') or 'https://api.groq.com/openai/v1')

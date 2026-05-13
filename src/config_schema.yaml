@@ -90,6 +90,10 @@ recording_options:
     value: ctrl+shift+space
     type: str
     description: "The keyboard shortcut to activate the recording and transcribing process. Separate keys with a '+'."
+  history_key:
+    value: alt+shift+z
+    type: str
+    description: "The keyboard shortcut to toggle the Transcript History popup (Ditto-style). Press once to open near the mouse cursor; press again to dismiss. Leave blank to disable."
   input_backend:
     value: auto
     type: str
@@ -363,10 +367,7 @@ llm_polish:
 
       LISTS: explicit enumeration (first/second/third) → numbered list with digits (1./2./3.); parallel items → bullet list with hyphen markers.
 
-      PROPER NOUNS (correct STT errors for these names only, no others). HIGH PRIORITY: when ANY of the listed misheard variants appears in the input, ALWAYS replace it with the correct spelling, even if the surrounding context is ambiguous.
-        Locations: Jasmine Journeys, Amado, Assagao, Colva, Goa, Majorda, Delhi.
-        People: Adhiraj, Kanika, Rakhi, Jyoti, Joppan chetta, Jeetender, Vikash, Preksha Shah, Vinu Daniel, Vinu, Wallmakers, Pratham, Survesh, Gandesh, Oshin ma'am, Man Singh.
-        Products: Plaud (plod / plowed / cloud), Soniox (sonic / sony ox / sonics), OwnerRez (onerous / owner res / own arrays / ownerraz), PriceLabs (price labs / letters / laps / priceless), Obsidian, Tavily, Jina, Mastra, Claude (cloud / claud).
+      {{PROPER_NOUNS_BLOCK}}
 
         Disambiguation for "cloud":
           - In tech-product context ("cloud workspace", "ask cloud", "cloud says") → replace with "Claude".
@@ -379,6 +380,51 @@ llm_polish:
       Do NOT translate Hindi to English. Keep code-switching natural: "kal subah meeting hai" stays as-is, not "tomorrow morning is the meeting".
 
       FORBIDDEN: no other word changes, no rephrasing, no adding content, no reordering, no removing or replacing any word, symbol, or punctuation that exists in the input. If unsure whether a change is allowed, do not make it — leave the text as-is.
+
+  proper_nouns:
+    type: dict
+    description: "Structured proper-nouns list used to render the PROPER NOUNS section of the polish prompt at runtime. Each entry has a 'word' (the correct spelling polish should emit) and 'misheard' (optional list of Whisper STT variants to auto-correct). Renderer output is substituted into the {{PROPER_NOUNS_BLOCK}} placeholder in system_prompt."
+    value:
+      locations:
+        - { word: Jasmine Journeys, misheard: [] }
+        - { word: Amado,            misheard: [] }
+        - { word: Assagao,          misheard: [] }
+        - { word: Colva,            misheard: [] }
+        - { word: Goa,              misheard: [] }
+        - { word: Majorda,          misheard: [] }
+        - { word: Delhi,            misheard: [] }
+      people:
+        - { word: Adhiraj,       misheard: [] }
+        - { word: Kanika,        misheard: [] }
+        - { word: Rakhi,         misheard: [] }
+        - { word: Jyoti,         misheard: [] }
+        - { word: Joppan chetta, misheard: [] }
+        - { word: Jeetender,     misheard: [] }
+        - { word: Vikash,        misheard: [] }
+        - { word: Preksha Shah,  misheard: [] }
+        - { word: Vinu Daniel,   misheard: [] }
+        - { word: Vinu,          misheard: [] }
+        - { word: Wallmakers,    misheard: [] }
+        - { word: Pratham,       misheard: [] }
+        - { word: Survesh,       misheard: [] }
+        - { word: Gandesh,       misheard: [] }
+        - { word: "Oshin ma’am", misheard: [] }
+        - { word: Man Singh,     misheard: [] }
+      products:
+        - { word: Plaud,    misheard: [plod, plowed, cloud] }
+        - { word: Soniox,   misheard: [sonic, sony ox, sonics] }
+        - { word: OwnerRez, misheard: [onerous, owner res, own arrays, ownerraz] }
+        - { word: PriceLabs, misheard: [price labs, letters, laps, priceless] }
+        - { word: Obsidian, misheard: [] }
+        - { word: Tavily,   misheard: [] }
+        - { word: Jina,     misheard: [] }
+        - { word: Mastra,   misheard: [] }
+        - { word: Claude,   misheard: [cloud, claud] }
+
+  enable_dict_autoadd_from_spelling:
+    value: true
+    type: bool
+    description: "Master kill-switch for the auto-add-from-spelling feature. When the polish prompt's SPELLING (dictionary add) rule fires on an explicit 'spelled' trigger, the spelled word is added to model_options.common.initial_prompt (Whisper STT bias) and to llm_polish.proper_nouns.people (polish active correction). Setting to false suppresses both writes; the polish output itself is unaffected."
 
 # Miscellaneous settings
 misc:
