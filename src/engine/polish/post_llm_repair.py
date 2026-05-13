@@ -13,8 +13,8 @@ and Section 6 for the cross-app research that informed the rejection rules.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 EMPTY_SENTINEL = "__EMPTY__"
@@ -46,6 +46,13 @@ _THINKING_TAG_PATTERNS = [
 # Wrap-around tags the polish prompt instructs the model to omit but
 # sometimes echoes anyway.
 _TRANSCRIPT_WRAPPER_TAGS = ("[TRANSCRIPT]", "[/TRANSCRIPT]")
+
+# Tail-marker emitted by the polish prompt's SPELLING (dictionary add) rule
+# when the explicit "spelled" trigger fires. Format: <<DICT_ADD: word1, word2>>
+# at end-of-output. Extracted into RepairResult.dict_additions and stripped
+# from the visible text. End-anchored so a stray marker mid-text doesn't get
+# silently consumed.
+_DICT_ADD_TAIL_PATTERN = re.compile(r"<<DICT_ADD:\s*([^>]+?)\s*>>\s*$")
 
 # Preamble regexes — strip leading "Here's the cleaned text:" /
 # "Sure, let me ..." style openers that slip past the prompt's IDENTITY
@@ -83,6 +90,14 @@ class RepairResult:
     # Human-readable reason for rejection (None when accepted).
     rejection_reason: Optional[str]
 
+    # Words the polish prompt's SPELLING (dictionary add) rule extracted from
+    # a "<word> spelled <letters>" pattern. Populated by parsing the
+    # <<DICT_ADD: word1, word2>> tail marker that the polish model emits when
+    # the explicit "spelled" trigger fires. The marker is stripped from
+    # final_text. The caller decides whether to actually persist these (gated
+    # by llm_polish.enable_dict_autoadd_from_spelling).
+    dict_additions: List[str] = field(default_factory=list)
+
 
 def _strip_wrapper_tags(text: str) -> str:
     for tag in _TRANSCRIPT_WRAPPER_TAGS:
@@ -118,6 +133,33 @@ def _starts_with_bad_token(text: str) -> Optional[str]:
     return None
 
 
+def _extract_dict_additions(text: str) -> tuple[str, List[str]]:
+    """Find a trailing <<DICT_ADD: ...>> marker, return (stripped_text, words).
+
+    If no marker is present, returns the text unchanged and an empty list. The
+    marker is end-anchored so a malformed mid-text occurrence is left alone
+    (rather than silently consumed). Words are split on comma, trimmed, and
+    de-duplicated case-insensitively in the order first seen.
+    """
+    match = _DICT_ADD_TAIL_PATTERN.search(text)
+    if not match:
+        return text, []
+    raw_words = match.group(1).split(",")
+    seen_lower = set()
+    words: List[str] = []
+    for w in raw_words:
+        cleaned = w.strip()
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        if lower in seen_lower:
+            continue
+        seen_lower.add(lower)
+        words.append(cleaned)
+    stripped = text[: match.start()].rstrip()
+    return stripped, words
+
+
 def _word_overlap_ratio(raw: str, polished: str) -> float:
     raw_words = {w for w in raw.lower().split() if w}
     if len(raw_words) < WORD_OVERLAP_MIN_RAW_WORDS:
@@ -145,13 +187,14 @@ def apply(raw: str, polished: Optional[str]) -> RepairResult:
     Order of operations:
       1. Strip [TRANSCRIPT] wrapper tags (model echo).
       2. Strip <thinking>/<reasoning>/<analysis> tags (VoiceInk pattern).
-      3. EMPTY sentinel -> return "" (clean no-paste).
-      4. Strip wrapping quotes.
-      5. Strip leading preamble via regex.
-      6. Empty after stripping -> reject, return raw.
-      7. Bad-first-token -> reject, return raw.
-      8. Levenshtein similarity -> reject if too low.
-      9. Word overlap floor -> reject if too low.
+      3. Extract + strip trailing <<DICT_ADD: ...>> marker (auto-add feature).
+      4. EMPTY sentinel -> return "" (clean no-paste).
+      5. Strip wrapping quotes.
+      6. Strip leading preamble via regex.
+      7. Empty after stripping -> reject, return raw.
+      8. Bad-first-token -> reject, return raw.
+      9. Levenshtein similarity -> reject if too low.
+      10. Word overlap floor -> reject if too low.
     """
     if polished is None:
         return RepairResult(final_text=raw, polish_rejected=True,
@@ -161,10 +204,16 @@ def apply(raw: str, polished: Optional[str]) -> RepairResult:
     p = _strip_wrapper_tags(p)
     p = _strip_thinking_tags(p)
 
+    # Extract + strip the auto-add tail marker before any other text checks so
+    # the marker text itself doesn't influence Levenshtein / word-overlap or
+    # leak into bad-first-token false positives. Empty list when absent.
+    p, dict_additions = _extract_dict_additions(p)
+
     # EMPTY sentinel -> intentional empty output, paste nothing.
     if p == EMPTY_SENTINEL:
         return RepairResult(final_text="", polish_rejected=False,
-                            rejection_reason=None)
+                            rejection_reason=None,
+                            dict_additions=dict_additions)
 
     p = _strip_wrapping_quotes(p)
     p = _strip_preamble(p)
@@ -196,4 +245,5 @@ def apply(raw: str, polished: Optional[str]) -> RepairResult:
             rejection_reason=f"Word overlap {overlap:.0%} < {WORD_OVERLAP_FLOOR:.0%}")
 
     return RepairResult(final_text=p, polish_rejected=False,
-                        rejection_reason=None)
+                        rejection_reason=None,
+                        dict_additions=dict_additions)

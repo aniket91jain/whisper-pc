@@ -8,6 +8,7 @@ from openai import OpenAI
 from utils import ConfigManager
 from engine.polish.post_llm_repair import apply as apply_post_llm_repair
 from engine.polish.proper_nouns_renderer import substitute as substitute_proper_nouns
+from notifications import fire_dict_addition
 
 
 # Cache of OpenAI SDK clients keyed by base_url. The SDK uses httpx with
@@ -454,10 +455,83 @@ def llm_polish(transcription):
                 f'LLM polish rejected ({repair.rejection_reason}); returning raw.'
             )
             return transcription
+
+        # Auto-add from spelling: when the polish prompt's SPELLING
+        # (dictionary add) rule fires on an explicit "spelled" trigger, it
+        # emits a <<DICT_ADD: ...>> tail marker that PostLlmRepair extracts
+        # into repair.dict_additions. Persist those words (gated by the
+        # master kill-switch) so future dictations pick them up via the STT
+        # vocabulary hint and the polish PROPER NOUNS active-correction list.
+        if repair.dict_additions and config.get('enable_dict_autoadd_from_spelling', True):
+            try:
+                _persist_dict_additions(repair.dict_additions)
+            except Exception as e:
+                ConfigManager.console_print(f'Dict auto-add failed: {e}')
+
         return repair.final_text
     except Exception as e:
         ConfigManager.console_print(f'LLM polish error (returning raw transcription): {e}')
         return transcription
+
+
+def _persist_dict_additions(words):
+    """Append the captured spelled words to the STT vocabulary hint and the
+    polish proper-nouns 'people' list (default category), de-duplicating
+    case-insensitively against existing entries. Persist to disk and fire the
+    notification event for the tray balloon.
+    """
+    if not words:
+        return
+
+    current_hint = ConfigManager.get_config_value('model_options', 'common', 'initial_prompt') or ''
+    hint_seen = {w.strip().lower() for w in current_hint.split(',') if w.strip()}
+
+    pn_section = ConfigManager.get_config_value('llm_polish', 'proper_nouns') or {}
+    if not isinstance(pn_section, dict):
+        pn_section = {}
+    people = list(pn_section.get('people') or [])
+    people_seen = {
+        (e.get('word') or '').strip().lower()
+        for e in people
+        if isinstance(e, dict)
+    }
+
+    added_to_hint = []
+    added_to_people = []
+    for word in words:
+        w = (word or '').strip()
+        if not w:
+            continue
+        lower = w.lower()
+        if lower not in hint_seen:
+            added_to_hint.append(w)
+            hint_seen.add(lower)
+        if lower not in people_seen:
+            added_to_people.append({'word': w, 'misheard': []})
+            people_seen.add(lower)
+
+    if not added_to_hint and not added_to_people:
+        return  # everything was already in the dictionary
+
+    if added_to_hint:
+        new_hint = current_hint.rstrip()
+        if new_hint and not new_hint.endswith(','):
+            new_hint += ', '
+        elif new_hint:
+            new_hint += ' '
+        new_hint += ', '.join(added_to_hint)
+        ConfigManager.set_config_value(new_hint, 'model_options', 'common', 'initial_prompt')
+
+    if added_to_people:
+        people.extend(added_to_people)
+        pn_section['people'] = people
+        ConfigManager.set_config_value(pn_section, 'llm_polish', 'proper_nouns')
+
+    ConfigManager.save_config()
+
+    visible_added = added_to_hint or [e['word'] for e in added_to_people]
+    ConfigManager.console_print(f"Auto-added to dictionary: {', '.join(visible_added)}")
+    fire_dict_addition(visible_added)
 
 
 def post_process_transcription(transcription):

@@ -3,7 +3,7 @@ import sys
 import time
 from audioplayer import AudioPlayer
 from pynput.keyboard import Controller
-from PyQt5.QtCore import QObject, QProcess
+from PyQt5.QtCore import QObject, QProcess, pyqtSignal
 from PyQt5.QtGui import QIcon, QCursor, QGuiApplication
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 
@@ -15,7 +15,15 @@ from ui.status_window import StatusWindow
 from ui.transcript_history_window import TranscriptHistoryWindow
 from transcription import create_local_model, prewarm_groq_connection
 from input_simulation import InputSimulator
+from notifications import register_dict_addition_listener
 from utils import ConfigManager
+
+
+class _DictAddSignal(QObject):
+    """Carrier QObject for the auto-add-from-spelling event. Lives on the
+    main thread so the connected slot runs there via queued connection, even
+    when emit() is called from the polish worker thread."""
+    added = pyqtSignal(list)
 
 
 class WhisperPCApp(QObject):
@@ -115,6 +123,25 @@ class WhisperPCApp(QObject):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
+
+        # Listen for "auto-added to dictionary" events fired by the polish
+        # pipeline. The signal is queued so it always runs on the main GUI
+        # thread, even though the polish call happens in ResultThread.
+        self._dict_add_signal = _DictAddSignal(self)
+        self._dict_add_signal.added.connect(self._show_dict_add_balloon)
+        register_dict_addition_listener(self._dict_add_signal.added.emit)
+
+    def _show_dict_add_balloon(self, words):
+        if not words or not self.tray_icon:
+            return
+        title = 'Whisper PC'
+        if len(words) == 1:
+            body = f"Added '{words[0]}' to dictionary"
+        else:
+            quoted = ', '.join(f"'{w}'" for w in words)
+            body = f"Added {quoted} to dictionary"
+        # 4000 ms is long enough to read but short enough not to linger.
+        self.tray_icon.showMessage(title, body, QSystemTrayIcon.Information, 4000)
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:  # left-click

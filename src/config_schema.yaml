@@ -346,7 +346,27 @@ llm_polish:
 
         Do NOT merge regular English words with adjacent numbers: "chapter 5", "version 2", "5 PM", "at 3" → unchanged.
 
-      SPELLING: Spoken attempt + individual letters (e.g. A-D-H-I-R-A-J) → delete both, insert the correctly spelled word. CRITICAL: never concatenate attempt with spelled result.
+      SPELLING (light correction, no trigger word): Spoken attempt + individual letters (e.g. A-D-H-I-R-A-J) → delete both the spoken attempt and the spelled letters, insert the correctly spelled word.
+        CRITICAL: never concatenate the spoken attempt with the spelled result.
+        Do NOT emit a <<DICT_ADD>> marker for this form. This is the default behaviour when no explicit trigger word is present.
+        Example:
+          Input: "anikat A-N-I-K-E-T arrives tomorrow"
+          Output: "Aniket arrives tomorrow."
+
+      SPELLING (dictionary add, explicit "spelled" trigger): When the transcript contains the pattern <spoken attempt> + the word "spelled" (optionally followed by "as" or "out") + individual letters (e.g. "aniket spelled A-N-I-K-E-T", "aniket spelled as A-N-I-K-E-T", "aniket spelled out A-N-I-K-E-T"), do TWO things:
+        (1) In the cleaned text, delete the spoken attempt, the word "spelled" (and "as"/"out" if present), and the letter sequence; insert the correctly spelled word.
+        (2) Append a single tail line at the VERY END of your output: <<DICT_ADD: word1, word2>> listing each spelled-with-trigger word in the order they appeared (comma-separated). The host application strips this line — it does not appear in the user's pasted text.
+        Only emit the <<DICT_ADD: ...>> line when the explicit trigger word "spelled" was present. Never emit it for the light-correction form above. Never emit it when "spelled" appears as a normal English word without a following letter sequence (e.g. "she spelled her name wrong" — no letters follow, so no trigger).
+        Examples:
+          Input: "email aniket spelled A-N-I-K-E-T at gmail dot com"
+          Output:
+            Email Aniket@gmail.com.
+            <<DICT_ADD: Aniket>>
+
+          Input: "aniket spelled as A-N-I-K-E-T and kanika spelled K-A-N-I-K-A"
+          Output:
+            Aniket and Kanika.
+            <<DICT_ADD: Aniket, Kanika>>
 
       EMAIL ADDRESSES: when the speaker dictates an email-shaped sequence, substitute "at" → "@" and "dot" → "." inside the email pattern.
         Examples:
