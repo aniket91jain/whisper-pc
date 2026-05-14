@@ -336,7 +336,7 @@ def _enforce_single_instance() -> None:
     PID. On startup:
       - If the file doesn't exist → write our PID, continue.
       - If the file exists AND that PID is alive AND its image is a
-        whisper-writer Python → exit (peer is running).
+        Whisper PC Python → exit (peer is running).
       - If the file exists but the PID is dead or unrelated → stale lock;
         overwrite with our PID and continue.
 
@@ -368,7 +368,7 @@ def _enforce_single_instance() -> None:
                 if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                     if exit_code.value == 259:
                         # Process is alive. We don't bother verifying it's a
-                        # whisper-writer Python — colliding with an unrelated
+                        # Whisper PC Python — colliding with an unrelated
                         # PID after a crash is rare (32-bit PID space) and the
                         # worst case is the user re-runs after a few seconds.
                         return True

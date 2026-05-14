@@ -7,7 +7,7 @@ This script rewrites the block between the BEGIN-SYNC and END-SYNC marker
 comments in whisper-mobile's PolishPromptLoader.kt with the current PC value,
 so the two apps' polish prompts stay byte-identical.
 
-Usage (run from the whisper-writer repo root):
+Usage (run from the whisper-pc repo root):
     python scripts/sync_polish_prompt_to_mobile.py [--mobile-repo PATH] [--check]
 
 Flags:
@@ -143,7 +143,7 @@ def main() -> int:
         print(f"OUT OF SYNC: {mobile_loader}", file=sys.stderr)
         print(
             "Run `python scripts/sync_polish_prompt_to_mobile.py` from the "
-            "whisper-writer repo root to update.",
+            "whisper-pc repo root to update.",
             file=sys.stderr,
         )
         return 1
