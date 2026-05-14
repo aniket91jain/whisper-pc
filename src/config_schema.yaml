@@ -5,6 +5,11 @@ model_options:
     type: bool
     description: "Toggle to choose whether to use the OpenAI API or a local Whisper model for transcription."
 
+  enable_local_fallback:
+    value: true
+    type: bool
+    description: "When use_api is true, also eagerly load the local faster-whisper model so it can stand in if the API fails after retries. Adds ~1-3 GB of RAM on startup (model load) but gives a working result when the API is wedged. Set false if you never want local fallback (lower memory)."
+
   # Common configuration options for both API and local models
   common:
     language:

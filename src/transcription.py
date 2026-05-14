@@ -1,6 +1,7 @@
 import io
 import os
 import re
+from typing import Optional
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
@@ -359,7 +360,39 @@ def transcribe_local(audio_data, local_model=None):
     return ''.join([segment.text for segment in list(response[0])])
 
 
+_TRANSIENT_API_ERROR_SIGNALS = (
+    'connection', 'timeout', 'dns', 'unreachable', 'getaddrinfo',
+    'network', 'temporary failure', 'reset', 'stream', 'broken pipe',
+)
+
+
+def _is_transient_api_error(exc: Exception) -> bool:
+    """Decide whether an API exception is worth retrying. Mirrors the
+    Mobile TranscriberClient.isTransientError heuristic — network-layer
+    failures retry; 4xx/auth do not."""
+    signal = (type(exc).__name__ + ' ' + (str(exc) or repr(exc))).lower()
+    return any(k in signal for k in _TRANSIENT_API_ERROR_SIGNALS)
+
+
+def _stt_call_budget_sec(audio_data) -> float:
+    """Audio-length-aware per-call timeout budget for the STT request.
+    Mirrors Mobile's TranscriberClient.callBudgetMs.
+
+        5s clip   → 10s budget
+        30s clip  → 15s budget
+        60s clip  → 20s budget
+        5min clip → 60s budget
+        15min clip→ 180s budget (cap)
+    """
+    sample_rate = ConfigManager.get_config_value('recording_options', 'sample_rate') or 16000
+    duration_sec = len(audio_data) / sample_rate
+    return min(180.0, 10.0 + duration_sec / 3.0)
+
+
 def transcribe_api(audio_data):
+    """Single Groq/OpenAI STT call. Raises TranscriptionAPIError on
+    failure. Caller [transcribe_api_with_retry] handles retry + local
+    fallback."""
     model_options = ConfigManager.get_config_section('model_options')
     base_url = model_options['api']['base_url'] or 'https://api.openai.com/v1'
 
@@ -377,12 +410,12 @@ def transcribe_api(audio_data):
             language=model_options['common']['language'],
             prompt=model_options['common']['initial_prompt'],
             temperature=model_options['common']['temperature'],
+            timeout=_stt_call_budget_sec(audio_data),
         )
     except Exception as e:
         cls = type(e).__name__
         msg = str(e) or repr(e)
-        signal = (cls + ' ' + msg).lower()
-        if any(k in signal for k in ('connection', 'timeout', 'dns', 'unreachable', 'getaddrinfo', 'network', 'temporary failure')):
+        if _is_transient_api_error(e):
             raise TranscriptionAPIError(f'No internet connection ({cls})') from e
         raise TranscriptionAPIError(f'API error ({cls}): {msg}') from e
 
@@ -390,6 +423,32 @@ def transcribe_api(audio_data):
     if not text.strip():
         raise TranscriptionAPIError('Empty response from transcription API')
     return text
+
+
+def transcribe_api_with_retry(audio_data, max_attempts: int = 2):
+    """Up-to-N STT attempts; only transient failures retry. Between
+    attempts, fire prewarm_groq_connection on a daemon thread so the next
+    try benefits from a freshly-established TLS session. Mirrors Mobile's
+    TranscriberClient.transcribeOneWithRetry."""
+    last_exc: Optional[TranscriptionAPIError] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return transcribe_api(audio_data)
+        except TranscriptionAPIError as e:
+            last_exc = e
+            if attempt >= max_attempts:
+                break
+            if not _is_transient_api_error(e.__cause__ or e):
+                break
+            ConfigManager.console_print(
+                f'STT attempt {attempt} failed ({e.reason}); retrying after warm.'
+            )
+            try:
+                from threading import Thread
+                Thread(target=prewarm_groq_connection, daemon=True).start()
+            except Exception:
+                pass
+    raise last_exc or TranscriptionAPIError('Unknown STT failure')
 
 
 def llm_polish(transcription):
@@ -421,10 +480,14 @@ def llm_polish(transcription):
         model_name = config.get('model') or ''
         if model_name.startswith('openai/gpt-oss'):
             extra_kwargs['reasoning_effort'] = config.get('reasoning_effort') or 'low'
+        # Polish payloads are tiny JSON; 20s is plenty for a healthy Groq
+        # response. Past that, PostLlmRepair's reject path will paste the
+        # cleaned raw transcript rather than waiting indefinitely.
         response = client.chat.completions.create(
             model=config['model'],
             max_tokens=config.get('max_tokens') or 1024,
             temperature=config.get('temperature', 0.2),
+            timeout=20.0,
             messages=[
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': f'[TRANSCRIPT]\n{transcription}\n[/TRANSCRIPT]'},
@@ -576,7 +639,22 @@ def transcribe(audio_data, local_model=None):
         return ''
 
     if ConfigManager.get_config_value('model_options', 'use_api'):
-        transcription = transcribe_api(audio_data)
+        try:
+            transcription = transcribe_api_with_retry(audio_data)
+        except TranscriptionAPIError as e:
+            # Fall back to the local faster-whisper model when both API
+            # attempts fail with a transient error AND a local model was
+            # eagerly loaded for fallback (see main.py / model_options.
+            # enable_local_fallback). User-visible feedback is left to
+            # result_thread which sees the resulting transcription.
+            allow_fallback = ConfigManager.get_config_value('model_options', 'enable_local_fallback')
+            if local_model is not None and allow_fallback and _is_transient_api_error(e.__cause__ or e):
+                ConfigManager.console_print(
+                    f'STT API exhausted retries ({e.reason}); falling back to local Whisper.'
+                )
+                transcription = transcribe_local(audio_data, local_model)
+            else:
+                raise
     else:
         transcription = transcribe_local(audio_data, local_model)
 

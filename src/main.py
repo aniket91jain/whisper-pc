@@ -65,7 +65,24 @@ class WhisperPCApp(QObject):
 
         model_options = ConfigManager.get_config_section('model_options')
         model_path = model_options.get('local', {}).get('model_path')
-        self.local_model = create_local_model() if not model_options.get('use_api') else None
+        # Local model lifecycle:
+        #   use_api=false                          → load eagerly (primary STT)
+        #   use_api=true + enable_local_fallback=true → load eagerly in a
+        #       daemon thread so it's ready when the API fails. Setting
+        #       self.local_model is deferred until the load completes.
+        #   use_api=true + enable_local_fallback=false → don't load (saves RAM)
+        self.local_model = None
+        if not model_options.get('use_api'):
+            self.local_model = create_local_model()
+        elif model_options.get('enable_local_fallback'):
+            from threading import Thread
+            def _load_fallback_model():
+                try:
+                    self.local_model = create_local_model()
+                    ConfigManager.console_print('Local-Whisper fallback ready.')
+                except Exception as e:
+                    ConfigManager.console_print(f'Local-Whisper fallback load failed: {e}')
+            Thread(target=_load_fallback_model, daemon=True).start()
 
         # Pre-warm the Groq HTTPS connection in a daemon thread so the first
         # dictation post-launch doesn't pay the TLS handshake (~200-400ms).
@@ -237,6 +254,14 @@ class WhisperPCApp(QObject):
             elif recording_mode == 'continuous':
                 self.stop_result_thread()
             return
+
+        # Event-driven warming: warm the Groq HTTPS connection in parallel
+        # with audio capture starting. The handshake (if pool went cold while
+        # idle) finishes during speech, not before upload. Free latency hiding.
+        if ConfigManager.get_config_value('model_options', 'use_api') or \
+                ConfigManager.get_config_value('llm_polish', 'enabled'):
+            from threading import Thread
+            Thread(target=prewarm_groq_connection, daemon=True).start()
 
         self.start_result_thread()
 
