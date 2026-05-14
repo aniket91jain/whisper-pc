@@ -513,11 +513,6 @@ def llm_polish(transcription):
         # prompt; and rejects via Levenshtein-ratio + word-overlap + bad-
         # first-token checks. On rejection it returns the raw transcript.
         repair = apply_post_llm_repair(transcription, polished)
-        if repair.polish_rejected:
-            ConfigManager.console_print(
-                f'LLM polish rejected ({repair.rejection_reason}); returning raw.'
-            )
-            return transcription
 
         # Auto-add from spelling: when the polish prompt's SPELLING
         # (dictionary add) rule fires on an explicit "spelled" trigger, it
@@ -525,11 +520,19 @@ def llm_polish(transcription):
         # into repair.dict_additions. Persist those words (gated by the
         # master kill-switch) so future dictations pick them up via the STT
         # vocabulary hint and the polish PROPER NOUNS active-correction list.
+        # Runs even when polish was rejected -- the marker is independent
+        # signal that the trigger word fired and the word was captured.
         if repair.dict_additions and config.get('enable_dict_autoadd_from_spelling', True):
             try:
                 _persist_dict_additions(repair.dict_additions)
             except Exception as e:
                 ConfigManager.console_print(f'Dict auto-add failed: {e}')
+
+        if repair.polish_rejected:
+            ConfigManager.console_print(
+                f'LLM polish rejected ({repair.rejection_reason}); returning raw.'
+            )
+            return transcription
 
         return repair.final_text
     except Exception as e:

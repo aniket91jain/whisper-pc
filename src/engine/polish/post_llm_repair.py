@@ -221,28 +221,36 @@ def apply(raw: str, polished: Optional[str]) -> RepairResult:
     if not p:
         return RepairResult(
             final_text=raw, polish_rejected=True,
-            rejection_reason="Polish empty after stripping wrappers and preamble")
+            rejection_reason="Polish empty after stripping wrappers and preamble",
+            dict_additions=dict_additions)
 
     bad_token = _starts_with_bad_token(p)
     if bad_token is not None and bad_token.lower() not in raw.lower():
         return RepairResult(
             final_text=raw, polish_rejected=True,
-            rejection_reason=f"Polish starts with bad token: {bad_token!r}")
+            rejection_reason=f"Polish starts with bad token: {bad_token!r}",
+            dict_additions=dict_additions)
 
-    if len(raw.strip()) >= LEVENSHTEIN_MIN_RAW_CHARS:
-        similarity = _levenshtein_similarity(raw, p)
-        if similarity < LEVENSHTEIN_REJECT_THRESHOLD:
+    # Skip similarity/overlap checks when a well-formed <<DICT_ADD>> marker
+    # was emitted: the SPELLING (dict-add) rule deletes the spoken attempt,
+    # the word "spelled", and the letter sequence, which legitimately
+    # collapses the output far below the similarity floor. The marker's
+    # presence is evidence polish did its job, not that it wandered.
+    if not dict_additions:
+        if len(raw.strip()) >= LEVENSHTEIN_MIN_RAW_CHARS:
+            similarity = _levenshtein_similarity(raw, p)
+            if similarity < LEVENSHTEIN_REJECT_THRESHOLD:
+                return RepairResult(
+                    final_text=raw, polish_rejected=True,
+                    rejection_reason=(
+                        f"Levenshtein similarity {similarity:.2f} < "
+                        f"{LEVENSHTEIN_REJECT_THRESHOLD}"))
+
+        overlap = _word_overlap_ratio(raw, p)
+        if overlap < WORD_OVERLAP_FLOOR:
             return RepairResult(
                 final_text=raw, polish_rejected=True,
-                rejection_reason=(
-                    f"Levenshtein similarity {similarity:.2f} < "
-                    f"{LEVENSHTEIN_REJECT_THRESHOLD}"))
-
-    overlap = _word_overlap_ratio(raw, p)
-    if overlap < WORD_OVERLAP_FLOOR:
-        return RepairResult(
-            final_text=raw, polish_rejected=True,
-            rejection_reason=f"Word overlap {overlap:.0%} < {WORD_OVERLAP_FLOOR:.0%}")
+                rejection_reason=f"Word overlap {overlap:.0%} < {WORD_OVERLAP_FLOOR:.0%}")
 
     return RepairResult(final_text=p, polish_rejected=False,
                         rejection_reason=None,
