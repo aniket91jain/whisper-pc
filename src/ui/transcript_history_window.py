@@ -1,5 +1,8 @@
 import os
 import sys
+import time
+import ctypes as _ctypes
+from datetime import datetime as _datetime
 import numpy as np
 import soundfile as sf
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -12,6 +15,82 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from ui.base_window import BaseWindow
 from transcription import transcribe, TranscriptionAPIError
 from utils import ConfigManager
+
+
+# --- Diagnostic instrumentation (popup_diag.log) ------------------------------
+# Lightweight timing/handle/memory snapshots written next to transcript_log.txt.
+# Goal: localize whether the popup hang is parse, widget creation, or GDI/USER
+# handle pressure on Windows. Remove once root cause is fixed.
+
+_DIAG_PATH = None
+
+
+def _diag_init(log_path):
+    global _DIAG_PATH
+    _DIAG_PATH = os.path.join(os.path.dirname(os.path.abspath(log_path)), 'popup_diag.log')
+
+
+def _diag(msg):
+    if _DIAG_PATH is None:
+        return
+    try:
+        ts = _datetime.now().isoformat(timespec='milliseconds')
+        with open(_DIAG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f'[{ts}] {msg}\n')
+    except Exception:
+        pass
+
+
+def _handle_counts():
+    """Return (GDI, USER) handle counts for the current process, or (None, None)."""
+    try:
+        user32 = _ctypes.windll.user32
+        user32.GetGuiResources.restype = _ctypes.c_uint
+        user32.GetGuiResources.argtypes = [_ctypes.c_void_p, _ctypes.c_uint]
+        kernel32 = _ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = _ctypes.c_void_p
+        hproc = kernel32.GetCurrentProcess()
+        gdi = user32.GetGuiResources(hproc, 0)  # GR_GDIOBJECTS
+        usr = user32.GetGuiResources(hproc, 1)  # GR_USEROBJECTS
+        return gdi, usr
+    except Exception:
+        return None, None
+
+
+def _mem_mb():
+    """Return working-set in MB via psapi, or None."""
+    try:
+        class _PMC(_ctypes.Structure):
+            _fields_ = [
+                ('cb', _ctypes.c_ulong),
+                ('PageFaultCount', _ctypes.c_ulong),
+                ('PeakWorkingSetSize', _ctypes.c_size_t),
+                ('WorkingSetSize', _ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', _ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', _ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', _ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', _ctypes.c_size_t),
+                ('PagefileUsage', _ctypes.c_size_t),
+                ('PeakPagefileUsage', _ctypes.c_size_t),
+            ]
+        pmc = _PMC()
+        pmc.cb = _ctypes.sizeof(_PMC)
+        hproc = _ctypes.windll.kernel32.GetCurrentProcess()
+        if _ctypes.windll.psapi.GetProcessMemoryInfo(hproc, _ctypes.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize / (1024 * 1024)
+    except Exception:
+        return None
+    return None
+
+
+def _fmt_mem(m):
+    return f'{m:.1f}MB' if m is not None else 'n/a'
+
+
+# Render only the most-recent N transcripts on first show; "Show older" reveals
+# more in fixed-size chunks. Keeps the popup snappy regardless of log length.
+INITIAL_RENDER_LIMIT = 25
+LOAD_MORE_INCREMENT = 25
 
 
 def _parse_log(log_path):
@@ -292,10 +371,21 @@ class TranscriptHistoryWindow(BaseWindow):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
+        _diag_init(log_path)
+        gdi0, usr0 = _handle_counts()
+        _diag(f'__init__ start gdi={gdi0} usr={usr0} mem={_fmt_mem(_mem_mb())} '
+              f'log_size={os.path.getsize(log_path) if os.path.isfile(log_path) else 0}B')
+        t0 = time.perf_counter()
         self._init_content()
+        t_init = time.perf_counter() - t0
+        t0 = time.perf_counter()
         self._load()
+        t_load = time.perf_counter() - t0
+        _diag(f'__init__ done init_content={t_init:.3f}s load={t_load:.3f}s')
 
     def showEvent(self, event):
+        t0 = time.perf_counter()
+        gdi0, usr0 = _handle_counts()
         super().showEvent(event)
         # WS_EX_NOACTIVATE: window receives mouse events but never becomes the
         # active (keyboard-focus) window when clicked — so clicks paste into the
@@ -309,13 +399,16 @@ class TranscriptHistoryWindow(BaseWindow):
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
         except Exception:
             pass  # Non-Windows or ctypes unavailable; window still stays on top
+        gdi1, usr1 = _handle_counts()
+        _diag(f'showEvent: {time.perf_counter()-t0:.3f}s '
+              f'gdi={gdi0}->{gdi1} usr={usr0}->{usr1} mem={_fmt_mem(_mem_mb())}')
 
     def _init_content(self):
         header_row = QHBoxLayout()
-        hint = QLabel('Click any entry to paste at cursor')
-        hint.setFont(QFont('Segoe UI', 9))
-        hint.setStyleSheet('color: #666;')
-        header_row.addWidget(hint)
+        self._hint_label = QLabel('Click any entry to paste at cursor')
+        self._hint_label.setFont(QFont('Segoe UI', 9))
+        self._hint_label.setStyleSheet('color: #666;')
+        header_row.addWidget(self._hint_label)
         header_row.addStretch()
 
         refresh_btn = QPushButton('↻  Refresh')
@@ -351,17 +444,35 @@ class TranscriptHistoryWindow(BaseWindow):
         self._scroll.setWidget(self._container)
         self.main_layout.addWidget(self._scroll)
 
-    def _load(self):
-        while self._cards_layout.count() > 1:
-            item = self._cards_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # All parsed entries (newest first); only a prefix is materialized as cards.
+        self._all_entries = []
+        self._rendered_count = 0
+        self._show_more_btn = None
 
+    def _load(self):
+        """Re-parse logs from disk and render the most-recent INITIAL_RENDER_LIMIT
+        entries. Older entries stay in self._all_entries until the user clicks
+        'Show older'."""
+        t_total_start = time.perf_counter()
+        gdi0, usr0 = _handle_counts()
+        mem0 = _mem_mb()
+
+        cleared = self._clear_cards()
+        t_clear = time.perf_counter() - t_total_start
+
+        t = time.perf_counter()
         ok_entries = _parse_log(self._log_path)
+        t_parse_ok = time.perf_counter() - t
+
+        t = time.perf_counter()
         failed_entries = _parse_failed_log(self._failed_log_path) if self._failed_log_path else []
+        t_parse_failed = time.perf_counter() - t
+
         entries = ok_entries + failed_entries
         # Newest first by timestamp string (ISO-like format sorts correctly)
         entries.sort(key=lambda e: e.get('timestamp', ''), reverse=True)
+        self._all_entries = entries
+        self._rendered_count = 0
 
         if not entries:
             label = QLabel('No transcriptions yet.\nDictate something and come back.')
@@ -369,19 +480,108 @@ class TranscriptHistoryWindow(BaseWindow):
             label.setStyleSheet('color: #aaa;')
             label.setAlignment(Qt.AlignCenter)
             self._cards_layout.insertWidget(0, label)
+            _diag(f'_load: empty total={time.perf_counter()-t_total_start:.3f}s '
+                  f'cleared={cleared}')
             return
 
-        for i, entry in enumerate(entries):
+        t = time.perf_counter()
+        rendered = self._render_more(INITIAL_RENDER_LIMIT)
+        t_cards = time.perf_counter() - t
+
+        gdi1, usr1 = _handle_counts()
+        mem1 = _mem_mb()
+        _diag(
+            f'_load: total={time.perf_counter()-t_total_start:.3f}s '
+            f'cleared={cleared} clear={t_clear:.3f}s '
+            f'parse_ok={t_parse_ok:.3f}s({len(ok_entries)}) '
+            f'parse_failed={t_parse_failed:.3f}s({len(failed_entries)}) '
+            f'rendered={rendered}/{len(entries)} cards={t_cards:.3f}s '
+            f'gdi={gdi0}->{gdi1} usr={usr0}->{usr1} '
+            f'mem={_fmt_mem(mem0)}->{_fmt_mem(mem1)}'
+        )
+
+    def _clear_cards(self):
+        """Remove all card widgets and any 'Show older' footer; keep the trailing
+        stretch. Returns the number of widgets cleared."""
+        cleared = 0
+        # Iterate from the front; the trailing stretch (a QSpacerItem, no widget)
+        # is naturally skipped because takeAt advances the live index.
+        i = 0
+        while i < self._cards_layout.count():
+            item = self._cards_layout.itemAt(i)
+            if item is None:
+                break
+            if item.widget() is not None:
+                taken = self._cards_layout.takeAt(i)
+                taken.widget().deleteLater()
+                cleared += 1
+            else:
+                i += 1
+        self._show_more_btn = None
+        return cleared
+
+    def _render_more(self, n):
+        """Materialize the next `n` entries from self._all_entries as cards,
+        starting at self._rendered_count. Returns how many cards were actually
+        added. Updates the 'Show older' footer."""
+        if self._show_more_btn is not None:
+            # Drop the existing footer; we'll re-add (or skip) below.
+            idx = self._cards_layout.indexOf(self._show_more_btn)
+            if idx >= 0:
+                self._cards_layout.takeAt(idx)
+            self._show_more_btn.deleteLater()
+            self._show_more_btn = None
+
+        start = self._rendered_count
+        end = min(start + n, len(self._all_entries))
+        # Cards live before the trailing stretch; insert at len-1 (stretch index).
+        for i in range(start, end):
+            entry = self._all_entries[i]
             if entry['kind'] == 'ok':
                 card = TranscriptCard(entry['timestamp'], entry['text'], self._container)
             else:
-                audio_abs = os.path.join(self._project_root, entry['audio_rel'].replace('/', os.sep))
+                audio_abs = os.path.join(
+                    self._project_root, entry['audio_rel'].replace('/', os.sep)
+                )
                 card = FailedTranscriptCard(
                     entry['timestamp'], audio_abs, entry['audio_rel'],
                     entry['error'], self._container,
                 )
                 card.retryRequested.connect(self._on_retry_requested)
-            self._cards_layout.insertWidget(i, card)
+            insert_at = self._cards_layout.count() - 1  # before the stretch
+            self._cards_layout.insertWidget(insert_at, card)
+        added = end - start
+        self._rendered_count = end
+
+        remaining = len(self._all_entries) - self._rendered_count
+        if remaining > 0:
+            self._show_more_btn = QPushButton(
+                f'Show {min(LOAD_MORE_INCREMENT, remaining)} older  '
+                f'({self._rendered_count} of {len(self._all_entries)} shown)'
+            )
+            self._show_more_btn.setFont(QFont('Segoe UI', 9))
+            self._show_more_btn.setFixedHeight(32)
+            self._show_more_btn.setCursor(QCursor(Qt.PointingHandCursor))
+            self._show_more_btn.setStyleSheet('''
+                QPushButton {
+                    background: #f0f0f0;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    padding: 0 12px;
+                    color: #404040;
+                }
+                QPushButton:hover { background: #e0e0e0; }
+            ''')
+            self._show_more_btn.clicked.connect(self._on_show_more_clicked)
+            insert_at = self._cards_layout.count() - 1
+            self._cards_layout.insertWidget(insert_at, self._show_more_btn)
+        return added
+
+    def _on_show_more_clicked(self):
+        t = time.perf_counter()
+        added = self._render_more(LOAD_MORE_INCREMENT)
+        _diag(f'_show_more: added={added} now_rendered={self._rendered_count}/'
+              f'{len(self._all_entries)} t={time.perf_counter()-t:.3f}s')
 
     def _on_retry_requested(self, audio_abs_path, card):
         if self._local_model is None and not ConfigManager.get_config_value('model_options', 'use_api'):
