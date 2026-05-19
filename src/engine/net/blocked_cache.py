@@ -79,27 +79,52 @@ _VPN_REGEX = re.compile('|'.join(_VPN_ADAPTER_PATTERNS), re.IGNORECASE)
 
 
 def is_on_vpn() -> bool:
-    """True iff a known-VPN network adapter is currently up. Best-effort —
-    psutil enumerates adapters; we look for known VPN driver names in the
-    up-and-running set. Returns False on any error so the path silently
-    falls back to the cached-block detection.
+    """True iff the network adapter currently carrying the default route is
+    a known VPN adapter (NordLynx, WireGuard, OpenVPN, etc.).
 
-    Caller should treat this as a *hint to prefer Gemini*, not a hard
-    declaration that Groq will fail.
+    Strict variant: a mere "VPN adapter is up" check would false-positive
+    when a VPN client is installed but disconnected — NordLynx in particular
+    stays `isup=True` with stale state after a Disconnect. We instead ask
+    the OS which adapter owns the outbound path via a UDP socket connect
+    (no packets sent — `connect()` on UDP just picks a route) and check
+    that adapter's name. This matches what `route print` would show as
+    the default-route interface, without spawning a process.
+
+    Returns False on any error (no internet, psutil not installed) so the
+    pipeline falls back to the cached-block detection.
     """
+    import socket
     try:
-        import psutil  # imported lazily — keeps cold-start cheap when feature unused
+        import psutil  # lazy — keeps cold-start cheap when feature unused
     except ImportError:
         return False
+
+    # Step 1: find the local IP that would be used to reach the public internet.
     try:
-        stats = psutil.net_if_stats()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Public anycast IP; no packets are sent — UDP connect() just
+            # binds to the local interface that the OS would route via.
+            s.connect(('8.8.8.8', 80))
+            outbound_ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return False  # no internet / interface down
+
+    # Sanity: 0.0.0.0 means no route picked; treat as not-VPN.
+    if not outbound_ip or outbound_ip == '0.0.0.0':
+        return False
+
+    # Step 2: find the adapter that owns that IP, check its name.
+    try:
+        addrs = psutil.net_if_addrs()
     except Exception:
         return False
-    for name, st in stats.items():
-        if not st.isup:
-            continue
-        if _VPN_REGEX.search(name):
-            return True
+    for name, entries in addrs.items():
+        for entry in entries:
+            if entry.family == socket.AF_INET and entry.address == outbound_ip:
+                return bool(_VPN_REGEX.search(name))
     return False
 
 
