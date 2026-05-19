@@ -1,7 +1,7 @@
 import io
 import os
 import re
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
@@ -9,6 +9,8 @@ from openai import OpenAI
 from utils import ConfigManager
 from engine.polish.post_llm_repair import apply as apply_post_llm_repair
 from engine.polish.proper_nouns_renderer import substitute as substitute_proper_nouns
+from engine.net import blocked_cache
+from engine.stt import gemini_stt
 from notifications import fire_dict_addition
 
 
@@ -57,6 +59,13 @@ class TranscriptionAPIError(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class GroqBlockedError(TranscriptionAPIError):
+    """Raised when Groq's Cloudflare WAF returns 403 — VPN exit IP, rate-
+    limited residential IP, etc. Distinct from generic API errors so the
+    retry/fallback layer can short-circuit to Gemini instead of paying
+    another guaranteed 403."""
 
 # Phrases Whisper is known to hallucinate on silence or near-silence.
 # Matched case-insensitively against the stripped transcription.
@@ -415,25 +424,63 @@ def transcribe_api(audio_data):
     except Exception as e:
         cls = type(e).__name__
         msg = str(e) or repr(e)
+        status = getattr(e, 'status_code', None)
+        # Cloudflare WAF returns 403 to VPN exit IPs (and some rate-limited
+        # residential IPs) before the request even reaches Groq. The openai
+        # SDK surfaces this as PermissionDeniedError or a generic APIStatus
+        # Error with status_code=403. Cache the verdict so the next call
+        # skips Groq entirely + raise the distinct subclass.
+        if status == 403 or 'PermissionDenied' in cls or 'Forbidden' in msg:
+            blocked_cache.mark_blocked()
+            raise GroqBlockedError(f'Groq returned 403 (WAF block — likely VPN exit IP)') from e
         if _is_transient_api_error(e):
             raise TranscriptionAPIError(f'No internet connection ({cls})') from e
         raise TranscriptionAPIError(f'API error ({cls}): {msg}') from e
 
+    # A successful response means the network is fine and Groq accepted us;
+    # clear any stale "blocked" verdict so we don't keep routing to Gemini
+    # after the user toggled VPN off.
+    blocked_cache.clear_blocked()
     text = response.text or ''
     if not text.strip():
         raise TranscriptionAPIError('Empty response from transcription API')
     return text
 
 
-def transcribe_api_with_retry(audio_data, max_attempts: int = 2):
-    """Up-to-N STT attempts; only transient failures retry. Between
-    attempts, fire prewarm_groq_connection on a daemon thread so the next
-    try benefits from a freshly-established TLS session. Mirrors Mobile's
-    TranscriberClient.transcribeOneWithRetry."""
+def transcribe_api_with_retry(audio_data, max_attempts: int = 2) -> Tuple[str, bool]:
+    """Run the API STT pipeline. Returns `(transcript, used_gemini_fallback)`.
+
+    Pre-flight: if a VPN adapter is up *or* a recent Groq probe returned 403,
+    skip Groq entirely and route to Gemini's audio endpoint. Saves a
+    guaranteed-403 round-trip + sidesteps the watchdog stall.
+
+    Otherwise, up to N attempts against Groq. Transient failures retry;
+    GroqBlockedError immediately falls through to Gemini (no retry). Mirrors
+    Mobile's TranscriberClient.transcribeOneWithRetry + DictationPipeline.run
+    routing logic.
+    """
+    on_vpn = blocked_cache.is_on_vpn()
+    cached_block = blocked_cache.is_likely_blocked()
+    if (on_vpn or cached_block) and gemini_stt.is_configured():
+        reason = blocked_cache.reason_label(on_vpn, cached_block)
+        ConfigManager.console_print(
+            f'STT: routing to Gemini pre-flight (reason={reason})'
+        )
+        return _gemini_transcribe(audio_data), True
+
     last_exc: Optional[TranscriptionAPIError] = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return transcribe_api(audio_data)
+            return transcribe_api(audio_data), False
+        except GroqBlockedError as e:
+            if gemini_stt.is_configured():
+                ConfigManager.console_print(
+                    f'STT: Groq returned 403 ({e.reason}); routing to Gemini'
+                )
+                return _gemini_transcribe(audio_data), True
+            # No Gemini key → propagate the block error so the caller can
+            # decide (e.g. fall back to local Whisper).
+            raise
         except TranscriptionAPIError as e:
             last_exc = e
             if attempt >= max_attempts:
@@ -449,6 +496,16 @@ def transcribe_api_with_retry(audio_data, max_attempts: int = 2):
             except Exception:
                 pass
     raise last_exc or TranscriptionAPIError('Unknown STT failure')
+
+
+def _gemini_transcribe(audio_data) -> str:
+    """Shared Gemini-STT entry — wraps GeminiSttError in TranscriptionAPIError
+    so the caller's single except branch handles both providers."""
+    sample_rate = ConfigManager.get_config_value('recording_options', 'sample_rate') or 16000
+    try:
+        return gemini_stt.transcribe(audio_data, sample_rate)
+    except gemini_stt.GeminiSttError as e:
+        raise TranscriptionAPIError(f'Gemini STT fallback failed: {e}') from e
 
 
 def llm_polish(transcription):
@@ -600,13 +657,17 @@ def _persist_dict_additions(words):
     fire_dict_addition(visible_added)
 
 
-def post_process_transcription(transcription):
+def post_process_transcription(transcription, skip_polish: bool = False):
     transcription = transcription.strip()
 
     transcription = _normalize_spoken_symbols(transcription)
 
-    # LLM polish runs on the raw stripped transcript, before whitespace/case tweaks
-    transcription = llm_polish(transcription)
+    # LLM polish runs on the raw stripped transcript, before whitespace/case
+    # tweaks. Skipped when the STT layer used the Gemini fallback — Groq
+    # polish would also 403 (same Cloudflare WAF block) and Gemini transcripts
+    # arrive already-punctuated, so the polish round-trip would be pure cost.
+    if not skip_polish:
+        transcription = llm_polish(transcription)
     transcription = _merge_adjacent_alphanumeric(transcription)
 
     post_processing = ConfigManager.get_config_section('post_processing')
@@ -641,9 +702,10 @@ def transcribe(audio_data, local_model=None):
         )
         return ''
 
+    used_gemini_fallback = False
     if ConfigManager.get_config_value('model_options', 'use_api'):
         try:
-            transcription = transcribe_api_with_retry(audio_data)
+            transcription, used_gemini_fallback = transcribe_api_with_retry(audio_data)
         except TranscriptionAPIError as e:
             # Fall back to the local faster-whisper model when both API
             # attempts fail with a transient error AND a local model was
@@ -692,4 +754,4 @@ def transcribe(audio_data, local_model=None):
             return ''
         transcription = stripped
 
-    return post_process_transcription(transcription)
+    return post_process_transcription(transcription, skip_polish=used_gemini_fallback)
