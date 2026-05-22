@@ -51,7 +51,9 @@ SAMPLE_RATE = 16000
 MAX_KEYTERMS = 50
 MAX_KEYTERM_LEN = 20
 KEEPALIVE_INTERVAL_S = 10  # ElevenLabs RT idle timeout is ~15s; ping every 10s
-COMMIT_TIMEOUT_S = 15.0     # max wait for committed_transcript after commit sent
+COMMIT_TIMEOUT_S = 5.0      # max wait for committed_transcript after commit sent
+                            # (bench: ElevenLabs RT finalises in 248-870ms healthy;
+                            #  5s catches real hangs without false-positive fallback)
 
 
 def _build_url(keyterms: List[str]) -> str:
