@@ -305,7 +305,10 @@ class KeyListener:
 
     def select_backend_from_config(self):
         """Select the active backend based on configuration."""
-        preferred_backend = ConfigManager.get_config_value('recording_options', 'input_backend')
+        # v0.3.4: input_backend setting removed (Linux-specific knob — auto is
+        # the only meaningful choice on the Windows-only fork). Always pick
+        # the best available backend at runtime.
+        preferred_backend = 'auto'
 
         if preferred_backend == 'auto':
             self.select_active_backend()

@@ -375,8 +375,9 @@ class WhisperPCApp(QObject):
         if self._history_window is not None and self._history_window.isVisible():
             self._history_window.refresh()
 
-        if ConfigManager.get_config_value('misc', 'noise_on_completion'):
-            AudioPlayer(os.path.join('assets', 'beep.wav')).play(block=True)
+        # v0.3.4: noise_on_completion removed from Settings (niche; users on
+        # the streaming path get instant paste anyway, so the completion beep
+        # adds nothing). If anyone needs it back, re-add config + UI.
 
         if ConfigManager.get_config_value('recording_options', 'recording_mode') == 'continuous':
             self.start_result_thread()

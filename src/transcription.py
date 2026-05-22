@@ -359,12 +359,17 @@ def transcribe_local(audio_data, local_model=None):
 
     audio_data_float = audio_data.astype(np.float32) / 32768.0
 
+    # v0.3.4: language/temperature pinned to safe defaults — used to be
+    # user-tunable but no one actually changes them, and auto-detect on
+    # language is correct for the user's Hindi/English code-switching.
+    # initial_prompt is the active vocabulary hint (auto-grows from the
+    # "spelled" feature) so still read from config.
     response = local_model.transcribe(
         audio=audio_data_float,
-        language=model_options['common']['language'],
-        initial_prompt=model_options['common']['initial_prompt'],
+        language=None,  # auto-detect (was: model_options['common']['language'])
+        initial_prompt=ConfigManager.get_config_value('model_options', 'common', 'initial_prompt'),
         condition_on_previous_text=model_options['local']['condition_on_previous_text'],
-        temperature=model_options['common']['temperature'],
+        temperature=0.0,  # was: model_options['common']['temperature']
         vad_filter=model_options['local']['vad_filter'],
     )
     return ''.join([segment.text for segment in list(response[0])])
@@ -403,8 +408,11 @@ def transcribe_api(audio_data):
     """Single Groq/OpenAI STT call. Raises TranscriptionAPIError on
     failure. Caller [transcribe_api_with_retry] handles retry + local
     fallback."""
-    model_options = ConfigManager.get_config_section('model_options')
-    base_url = model_options['api']['base_url'] or 'https://api.openai.com/v1'
+    # v0.3.4: base_url + model pinned to Groq production values. The legacy
+    # user-tunable config (model_options.api.{model,base_url}) was removed
+    # because it defaulted to "whisper-1" against api.openai.com which has
+    # been wrong for a year. Engine choice is now made via stt_engine.
+    base_url = 'https://api.groq.com/openai/v1'
 
     try:
         client = get_openai_client(base_url)
@@ -415,11 +423,11 @@ def transcribe_api(audio_data):
         byte_io.seek(0)
 
         response = client.audio.transcriptions.create(
-            model=model_options['api']['model'],
+            model='whisper-large-v3-turbo',
             file=('audio.wav', byte_io, 'audio/wav'),
-            language=model_options['common']['language'],
-            prompt=model_options['common']['initial_prompt'],
-            temperature=model_options['common']['temperature'],
+            language=None,  # auto-detect
+            prompt=ConfigManager.get_config_value('model_options', 'common', 'initial_prompt'),
+            temperature=0.0,
             timeout=_stt_call_budget_sec(audio_data),
         )
     except Exception as e:
@@ -704,13 +712,12 @@ def post_process_transcription(transcription, skip_polish: bool = False):
         transcription = llm_polish(transcription)
     transcription = _merge_adjacent_alphanumeric(transcription)
 
+    # v0.3.4: remove_trailing_period and remove_capitalization were removed
+    # from the Settings UI; they're niche transforms and the cleaner code path
+    # is to just default-off. add_trailing_space stays user-facing.
     post_processing = ConfigManager.get_config_section('post_processing')
-    if post_processing['remove_trailing_period'] and transcription.endswith('.'):
-        transcription = transcription[:-1]
-    if post_processing['add_trailing_space']:
+    if post_processing.get('add_trailing_space', True):
         transcription += ' '
-    if post_processing['remove_capitalization']:
-        transcription = transcription.lower()
 
     return transcription
 
@@ -958,12 +965,11 @@ def transcribe(audio_data, local_model=None, force_groq: bool = False):
             ConfigManager.console_print(f'Whisper hallucination discarded (substring "{needle}"): "{transcription.strip()}"')
             return ''
 
-    # Non-English script in the output (Cyrillic, Arabic, CJK, Turkish-specific
-    # Latin, etc.) when language is configured as English — Whisper hallucinated.
-    language = ConfigManager.get_config_value('model_options', 'common', 'language')
-    if language == 'en' and _NON_ENGLISH_SCRIPT_RE.search(transcription):
-        ConfigManager.console_print(f'Whisper hallucination discarded (non-English script): "{transcription.strip()}"')
-        return ''
+    # v0.3.4: the non-English-script hallucination check used to be gated on
+    # an explicit language='en' config (so Hindi-English users wouldn't trip
+    # it). Now the user is on auto-detect; we drop the check entirely. A real
+    # non-English transcription will just pass through, which is what they
+    # want for Hindi-English code switching anyway.
 
     # Strip trailing "Thank you" appended by Whisper at the end of real transcriptions.
     stripped = re.sub(r'[,]?\s*\bthank you[.!]?\s*$', '', transcription, flags=re.IGNORECASE).strip()
