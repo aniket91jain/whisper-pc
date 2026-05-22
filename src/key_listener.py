@@ -282,6 +282,7 @@ class KeyListener:
         self.active_backend = None
         self.key_chord = None
         self.history_chord = None
+        self.pause_chord = None
         # Tracks whether the most recent activation transition was actually
         # delivered to listeners. Used to avoid firing on_deactivate after an
         # on_activate that we suppressed due to a longer chord (history) also
@@ -291,10 +292,12 @@ class KeyListener:
         self.callbacks = {
             "on_activate": [],
             "on_deactivate": [],
-            "on_history_activate": []
+            "on_history_activate": [],
+            "on_pause_activate": [],
         }
         self.load_activation_keys()
         self.load_history_keys()
+        self.load_pause_keys()
         self.initialize_backends()
         self.select_backend_from_config()
 
@@ -408,6 +411,19 @@ class KeyListener:
         """Reload the history hotkey after settings changes."""
         self.load_history_keys()
 
+    def load_pause_keys(self):
+        """Load pause/resume hotkey from configuration. Blank = disabled."""
+        combo = ConfigManager.get_config_value('recording_options', 'pause_key')
+        if not combo or not combo.strip():
+            self.pause_chord = None
+            return
+        keys = self.parse_key_combination(combo)
+        self.pause_chord = KeyChord(keys) if keys else None
+
+    def update_pause_keys(self):
+        """Reload the pause hotkey after settings changes."""
+        self.load_pause_keys()
+
     def on_input_event(self, event):
         """Handle input events and trigger callbacks if the key chord becomes active or inactive."""
         if not self.active_backend:
@@ -415,9 +431,11 @@ class KeyListener:
 
         key, event_type = event
 
-        # Evaluate history first so we can suppress an activation that would
-        # otherwise fire on the same input event when chords overlap (e.g.
-        # activation=Alt+Z, history=Alt+Shift+Z share Alt and Z).
+        # Evaluate longer chords first so we can suppress shorter activations
+        # that would also fire on the same input event when chords overlap.
+        # Default: activation=Alt+Z, history=Alt+Shift+Z, pause=Alt+Shift+P.
+        # History and pause both share the Alt+Shift prefix; pause does NOT
+        # share Z with activation, so it doesn't need to suppress activation.
         history_fired = False
         if self.history_chord:
             was_active = self.history_chord.is_active()
@@ -425,6 +443,12 @@ class KeyListener:
             if not was_active and is_active:
                 history_fired = True
                 self._trigger_callbacks("on_history_activate")
+
+        if self.pause_chord:
+            was_active = self.pause_chord.is_active()
+            is_active = self.pause_chord.update(key, event_type)
+            if not was_active and is_active:
+                self._trigger_callbacks("on_pause_activate")
 
         if self.key_chord:
             was_active = self.key_chord.is_active()

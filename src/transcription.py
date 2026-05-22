@@ -22,6 +22,34 @@ from notifications import fire_dict_addition
 _OPENAI_CLIENTS: dict = {}
 
 
+def _write_log_entry(raw: str, polished: str, engine: str) -> None:
+    """Append a single dictation entry to transcript_log.txt.
+
+    Every transcription path goes through this so the user can audit which
+    backend produced each entry (engine field). Engine values are stable
+    identifiers — `groq+llama`, `groq+llama→gemini-fallback`,
+    `groq+llama→local-whisper-fallback`, `elevenlabs-stream`,
+    `elevenlabs-burst`. Failures fail silently — logging is informational,
+    not load-bearing.
+    """
+    try:
+        import datetime
+        log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'transcript_log.txt',
+        )
+        with open(log_path, 'a', encoding='utf-8') as f:
+            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            f.write(
+                f'[{ts}]\n'
+                f'  ENGINE:  {engine}\n'
+                f'  RAW:     {(raw or "").strip()}\n'
+                f'  POLISHED: {polished}\n\n'
+            )
+    except Exception:
+        pass
+
+
 def get_openai_client(base_url: str = 'https://api.groq.com/openai/v1'):
     """Return a cached OpenAI SDK client for the given base URL.
 
@@ -517,7 +545,7 @@ def _gemini_transcribe(audio_data) -> str:
         raise TranscriptionAPIError(f'Gemini STT fallback failed: {e}') from e
 
 
-def llm_polish(transcription):
+def llm_polish(transcription, engine: str = 'groq+llama'):
     config = ConfigManager.get_config_section('llm_polish')
     if not config.get('enabled') or not transcription.strip():
         return transcription
@@ -581,14 +609,11 @@ def llm_polish(transcription):
             except Exception:
                 pass
 
-        try:
-            import datetime
-            log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcript_log.txt')
-            with open(log_path, 'a', encoding='utf-8') as f:
-                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f'[{ts}]\n  RAW:     {transcription.strip()}\n  POLISHED: {polished}\n\n')
-        except Exception:
-            pass
+        # Engine label is passed in from `post_process_transcription`; the
+        # Groq + Llama-polish chain is the default. Other engines (Gemini
+        # fallback, local-Whisper fallback, ElevenLabs) write their own log
+        # entries from their own code paths.
+        _write_log_entry(transcription, polished, engine)
 
         # Delegate post-LLM safety checks to the shared repair module so
         # Mobile + PC stay in lockstep. The module strips wrapper tags,
@@ -699,7 +724,8 @@ def _persist_dict_additions(words):
     fire_dict_addition(visible_added)
 
 
-def post_process_transcription(transcription, skip_polish: bool = False):
+def post_process_transcription(transcription, skip_polish: bool = False,
+                               engine: str = 'groq+llama'):
     transcription = transcription.strip()
 
     transcription = _normalize_spoken_symbols(transcription)
@@ -709,7 +735,12 @@ def post_process_transcription(transcription, skip_polish: bool = False):
     # polish would also 403 (same Cloudflare WAF block) and Gemini transcripts
     # arrive already-punctuated, so the polish round-trip would be pure cost.
     if not skip_polish:
-        transcription = llm_polish(transcription)
+        transcription = llm_polish(transcription, engine=engine)
+    else:
+        # Paths that skip LLM polish (Gemini fallback, local-Whisper fallback)
+        # still log so the user can audit engine usage from transcript_log.txt.
+        # POLISHED is identical to RAW for these because no LLM step ran.
+        _write_log_entry(transcription, transcription, engine)
     transcription = _merge_adjacent_alphanumeric(transcription)
 
     # v0.3.4: remove_trailing_period and remove_capitalization were removed
@@ -781,13 +812,16 @@ def _transcribe_via_elevenlabs(audio_data):
     return _finalize_elevenlabs_transcript(raw_text, api_key)
 
 
-def _finalize_elevenlabs_transcript(raw_text: str, api_key: str) -> str:
+def _finalize_elevenlabs_transcript(raw_text: str, api_key: str,
+                                     engine: str = 'elevenlabs-burst') -> str:
     """Post-STT polish + persistence for the ElevenLabs path.
 
-    Shared between record-then-burst (`_transcribe_via_elevenlabs`) and the
-    streaming-during-recording path (`transcribe_streaming_result`). Runs
-    RegexPolish, persists any auto-added proper nouns, schedules the server-
-    side history-delete sweep, and returns the polished final text.
+    Shared between record-then-burst (`_transcribe_via_elevenlabs`, engine =
+    'elevenlabs-burst') and the streaming-during-recording path
+    (`transcribe_streaming_result`, engine = 'elevenlabs-stream'). Runs
+    RegexPolish, persists any auto-added proper nouns, writes the
+    transcript-log entry tagged with the engine, schedules the server-side
+    history-delete sweep, and returns the polished final text.
     """
     from engine.polish import regex_polish
 
@@ -800,6 +834,10 @@ def _finalize_elevenlabs_transcript(raw_text: str, api_key: str) -> str:
                 _persist_dict_additions(polish_result.dict_additions)
             except Exception as e:
                 ConfigManager.console_print(f'dict_add persistence failed: {e}')
+
+    # Log the entry with engine info so the user can audit which backend ran.
+    # Without this the ElevenLabs path was leaving transcript_log.txt empty.
+    _write_log_entry(raw_text, polish_result.final_text, engine)
 
     try:
         from engine.retention import history_delete_worker
@@ -822,7 +860,7 @@ def transcribe_streaming_result(raw_text: str) -> str:
     if not raw_text or not raw_text.strip():
         return ''
     api_key = os.getenv('ELEVENLABS_API_KEY') or ConfigManager.get_config_value('model_options', 'elevenlabs_api_key') or ''
-    return _finalize_elevenlabs_transcript(raw_text, api_key)
+    return _finalize_elevenlabs_transcript(raw_text, api_key, engine='elevenlabs-stream')
 
 
 def _classify_elevenlabs_failure(reason: str) -> str:
@@ -929,6 +967,7 @@ def transcribe(audio_data, local_model=None, force_groq: bool = False):
         return ''
 
     used_gemini_fallback = False
+    used_local_fallback = False
     if ConfigManager.get_config_value('model_options', 'use_api'):
         try:
             transcription, used_gemini_fallback = transcribe_api_with_retry(audio_data)
@@ -944,10 +983,12 @@ def transcribe(audio_data, local_model=None, force_groq: bool = False):
                     f'STT API exhausted retries ({e.reason}); falling back to local Whisper.'
                 )
                 transcription = transcribe_local(audio_data, local_model)
+                used_local_fallback = True
             else:
                 raise
     else:
         transcription = transcribe_local(audio_data, local_model)
+        used_local_fallback = True
 
     ConfigManager.console_print(f'Whisper output: "{transcription.strip()}"')
 
@@ -979,10 +1020,25 @@ def transcribe(audio_data, local_model=None, force_groq: bool = False):
             return ''
         transcription = stripped
 
-    result = post_process_transcription(transcription, skip_polish=used_gemini_fallback)
+    # Engine label resolution for the log entry: Gemini and local-Whisper
+    # fallbacks each replace the STT half but keep the same Llama-polish stage
+    # *unless* skip_polish fires. We arrow-chain the names so an audit reader
+    # can see the actual path (e.g. `groq→gemini` vs straight `groq+llama`).
+    if used_local_fallback:
+        engine_label = 'groq→local-whisper-fallback'
+    elif used_gemini_fallback:
+        engine_label = 'groq→gemini-fallback'
+    else:
+        engine_label = 'groq+llama'
+    result = post_process_transcription(
+        transcription,
+        skip_polish=used_gemini_fallback,
+        engine=engine_label,
+    )
     try:
         from dict_diag import dd
-        dd('transcribe.return', result, used_gemini=used_gemini_fallback)
+        dd('transcribe.return', result, used_gemini=used_gemini_fallback,
+           engine=engine_label)
     except Exception:
         pass
     return result

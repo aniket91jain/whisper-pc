@@ -541,10 +541,16 @@ class InputSimulator:
         # Alt was still virtually down. Direct SendInput also routes through
         # Word's accelerator handling more reliably.
         self._send_ctrl_v()
-        # Wait long enough for Word's clipboard reader to consume the data
-        # before we restore the previous clipboard contents. 100ms wasn't
-        # enough on Word with its rich-paste pipeline; 300ms covers it.
-        time.sleep(0.3)
+        # Wait long enough for the target app to consume the clipboard data
+        # before we restore the previous contents. Word (and other Office body
+        # controls) have a rich-paste pipeline that needs ~300ms; every other
+        # app (Chrome, Outlook, Loop, Teams new, Notepad 11, VS Code, ...)
+        # consumes within a single frame, so 60ms is plenty and saves ~240ms
+        # off the perceived paste time.
+        if class_name in self._OFFICE_BODY_CLASSES:
+            time.sleep(0.3)
+        else:
+            time.sleep(0.06)
         try:
             pyperclip.copy(saved)
         except Exception:

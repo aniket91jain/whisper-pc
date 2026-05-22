@@ -4,12 +4,12 @@ model_options:
   #   "groq"       — Whisper-large-v3-turbo via Groq + Llama polish (v0.1/v0.2)
   #   "elevenlabs" — Scribe v2 Realtime + client-side RegexPolish (v0.3+)
   stt_engine:
-    value: groq
+    value: elevenlabs
     type: str
-    description: "Which STT backend to use. groq = Whisper + Llama polish (legacy). elevenlabs = ElevenLabs Scribe v2 Realtime + RegexPolish (v0.3 default once you've added the key)."
+    description: "Which STT backend to use. elevenlabs = Scribe v2 Realtime + client-side RegexPolish (default, lowest latency, streams during recording). groq = Whisper + Llama polish (legacy, burst-after-stop, ~1s slower stop-to-paste)."
     options:
-      - groq
       - elevenlabs
+      - groq
 
   # v0.3 ElevenLabs API key. Stored here for the settings UI to find — the
   # actual env-based key in .env (ELEVENLABS_API_KEY) is also checked at
@@ -147,6 +147,10 @@ recording_options:
     value: alt+shift+z
     type: str
     description: "The keyboard shortcut to toggle the Transcript History popup (Ditto-style). Press once to open near the mouse cursor; press again to dismiss. Leave blank to disable."
+  pause_key:
+    value: alt+shift+p
+    type: str
+    description: "The keyboard shortcut to pause/resume an active recording. While recording, pressing this pauses (bubble turns stable green). Pressing it again resumes (bubble turns red and pulses). The activation shortcut still ends recording and transcribes regardless of pause state. Leave blank to disable."
   recording_mode:
     value: continuous
     type: str
@@ -172,6 +176,18 @@ recording_options:
     value: 100
     type: int
     description: "The minimum duration in milliseconds for a recording to be processed. Recordings shorter than this will be discarded."
+  always_warm_mic:
+    value: true
+    type: bool
+    description: "When true, the mic + ElevenLabs WS are kept warm while the workstation is unlocked AND has had dictation activity within the last `warm_mic_idle_minutes`. On screen lock or idle timeout, both are closed (mic-in-use indicator goes dark). On screen unlock OR a dictation, both are warmed within ~5s. Dictation while cold falls back to a per-hotkey mic open (~100-300ms leading-words clip on that one dictation), then warm-up resumes. Set false to disable entirely and always open the mic per-hotkey."
+  warm_mic_idle_minutes:
+    value: 10
+    type: int
+    description: "Minutes of no dictation after which the warm mic and WS session pool are cooled down. Reset on each dictation completion and on screen unlock. Lower = more privacy-friendly (mic indicator off sooner). Higher = more likely to be warm when you come back."
+  preroll_ms:
+    value: 200
+    type: int
+    description: "Milliseconds of pre-hotkey audio to include in each recording. Captures speech the user starts a fraction of a second before the keypress lands. Only used when the mic is warm at the moment of the hotkey."
 
 # Post-processing options for the transcribed text
 post_processing:

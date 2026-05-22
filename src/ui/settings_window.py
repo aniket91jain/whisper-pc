@@ -78,52 +78,138 @@ class SettingsWindow(BaseWindow):
         self._apply_contextual_visibility()
 
     def _apply_stylesheet(self) -> None:
-        """Soft, modern QSS — gentle borders on group boxes, breathable tab
-        headers, larger buttons. Keeps the OS theme but tightens spacing."""
+        """Modern QSS with Material-inspired form fields. The previous
+        stylesheet declared no border/background on QLineEdit + QComboBox, so
+        on the white form panel the fields were effectively invisible — the
+        API-key dots floated in space with nothing around them. This fixes
+        the field affordance: visible default border, hover lift, distinct
+        focus state with an accent color."""
         self.setStyleSheet("""
             QTabWidget::pane {
-                border: 1px solid palette(mid);
+                border: 1px solid #d0d0d0;
                 border-radius: 6px;
                 top: -1px;
             }
             QTabBar::tab {
-                padding: 8px 18px;
+                /* font-weight is set BOLD on all tabs (not just selected) so
+                 * Qt's tabSizeHint reserves bold-width up front. Without this
+                 * the bold ":selected" text overflows and gets cut off. */
+                padding: 8px 22px;
                 margin-right: 2px;
                 border-top-left-radius: 6px;
                 border-top-right-radius: 6px;
                 background: palette(window);
+                color: #6a6a6a;
+                font-weight: 600;
+            }
+            QTabBar::tab:hover {
+                color: #2a2a2a;
             }
             QTabBar::tab:selected {
-                background: palette(base);
-                border: 1px solid palette(mid);
-                border-bottom: 1px solid palette(base);
+                background: #ffffff;
+                border: 1px solid #d0d0d0;
+                border-bottom: 1px solid #ffffff;
+                color: #1a1a1a;
             }
             QGroupBox {
                 font-weight: 600;
-                border: 1px solid palette(mid);
+                border: 1px solid #d0d0d0;
                 border-radius: 6px;
                 margin-top: 14px;
                 padding-top: 16px;
-                background-color: palette(base);
+                background-color: #ffffff;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 12px;
                 padding: 0 6px;
-                background-color: palette(base);
+                background-color: #ffffff;
+                color: #404040;
             }
             QPushButton {
                 padding: 7px 18px;
+                border: 1px solid #c0c0c0;
                 border-radius: 5px;
                 min-width: 100px;
+                background: #f5f5f5;
+                color: #2a2a2a;
             }
-            QLineEdit, QComboBox {
-                padding: 5px 8px;
+            QPushButton:hover {
+                background: #ebebeb;
+                border-color: #a0a0a0;
+            }
+            QPushButton:pressed {
+                background: #dcdcdc;
+            }
+            /* --- Form fields: previously invisible, now Material-style --- */
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                padding: 6px 10px;
+                border: 1px solid #c8c8c8;
                 border-radius: 4px;
+                background-color: #ffffff;
+                color: #202020;
+                selection-background-color: #4a8edc;
+                selection-color: #ffffff;
+                min-height: 20px;
+            }
+            QLineEdit:hover, QComboBox:hover,
+            QSpinBox:hover, QDoubleSpinBox:hover {
+                border-color: #888888;
+            }
+            QLineEdit:focus, QComboBox:focus,
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 2px solid #4a8edc;
+                /* compensate for the +1px border so layout doesn't jump */
+                padding: 5px 9px;
+            }
+            QLineEdit:disabled, QComboBox:disabled,
+            QSpinBox:disabled, QDoubleSpinBox:disabled {
+                background-color: #f4f4f4;
+                color: #999999;
+                border-color: #dddddd;
+            }
+            QLineEdit:read-only {
+                background-color: #f7f7f7;
+                color: #555555;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 22px;
+            }
+            QComboBox::down-arrow {
+                /* Use the OS default arrow but keep room for hover */
+                width: 10px;
+                height: 10px;
+            }
+            QCheckBox {
+                spacing: 8px;
+                color: #2a2a2a;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #b0b0b0;
+                border-radius: 3px;
+                background-color: #ffffff;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #4a8edc;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #4a8edc;
+                border-color: #4a8edc;
+                image: none;
             }
             QToolButton {
                 padding: 2px;
+                border-radius: 3px;
+            }
+            QToolButton:hover {
+                background: #ebebeb;
+            }
+            QLabel {
+                color: #2a2a2a;
             }
         """)
 
@@ -274,6 +360,18 @@ class SettingsWindow(BaseWindow):
             description=(
                 'Toggles the Transcript History popup (Ditto-style). Leave '
                 'blank to disable.'
+            ),
+        )
+
+        self._add_line(
+            form, 'Pause/resume hotkey',
+            path=('recording_options', 'pause_key'),
+            default='alt+shift+p',
+            description=(
+                'Pauses an active recording (bubble turns stable green) and '
+                'resumes it (back to red pulse). The activation hotkey still '
+                'ends + transcribes regardless of pause state. Leave blank '
+                'to disable.'
             ),
         )
 

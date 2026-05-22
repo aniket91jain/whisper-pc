@@ -3,7 +3,7 @@ import sys
 import time
 from audioplayer import AudioPlayer
 from pynput.keyboard import Controller
-from PyQt5.QtCore import Qt, QObject, QProcess, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, QProcess, QTimer, pyqtSignal
 from PyQt5.QtGui import QIcon, QCursor, QGuiApplication
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 
@@ -13,10 +13,15 @@ from ui.main_window import MainWindow
 from ui.settings_window import SettingsWindow
 from ui.status_window import StatusWindow
 from ui.transcript_history_window import TranscriptHistoryWindow
+from ui.recording_bubble import RecordingBubble
 from transcription import create_local_model, prewarm_groq_connection
 from input_simulation import InputSimulator
 from notifications import register_dict_addition_listener
 from utils import ConfigManager
+from engine.audio.capture_service import AudioCaptureService
+from engine.audio.screen_lock_monitor import ScreenLockMonitor
+from engine.audio.warmup_coordinator import WarmupCoordinator
+from engine.stt.elevenlabs_session_pool import ElevenLabsSessionPool
 
 
 class _DictAddSignal(QObject):
@@ -39,6 +44,23 @@ class _HistoryHotkeySignal(QObject):
     GUI thread on Windows can deadlock the hook thread and freeze the entire
     desktop — see Repos/plans/whisper-pc-popup-1.md for the full diagnosis."""
     triggered = pyqtSignal()
+
+
+class _PauseHotkeySignal(QObject):
+    """Carrier QObject that marshals the pause/resume hotkey from pynput onto
+    the GUI thread. Same rationale as _HistoryHotkeySignal — never call into
+    Qt widgets or the audio-thread mutex from the hook thread directly."""
+    triggered = pyqtSignal()
+
+
+class _BubbleStateSignal(QObject):
+    """Carrier for thread-safe RecordingBubble state changes. The bubble's
+    set_state() touches QWidgets (show/raise/timer.start), which is undefined
+    when called from any thread other than the GUI thread. Routes every
+    state request through a Qt.QueuedConnection so callers from
+    on_activation (pynput hook thread) or on_transcription_complete (GUI
+    thread, fine but harmless) all converge on the GUI thread."""
+    requested = pyqtSignal(str)
 
 
 class WhisperPCApp(QObject):
@@ -86,6 +108,15 @@ class WhisperPCApp(QObject):
         self.key_listener.add_callback(
             "on_history_activate", self._history_hotkey_signal.triggered.emit,
         )
+        # Pause/resume hotkey: same marshaling pattern. Idempotent toggle on
+        # the active ResultThread when a recording is in flight.
+        self._pause_hotkey_signal = _PauseHotkeySignal(self)
+        self._pause_hotkey_signal.triggered.connect(
+            self._on_pause_hotkey_gui, Qt.QueuedConnection,
+        )
+        self.key_listener.add_callback(
+            "on_pause_activate", self._pause_hotkey_signal.triggered.emit,
+        )
 
         model_options = ConfigManager.get_config_section('model_options')
         model_path = model_options.get('local', {}).get('model_path')
@@ -112,9 +143,57 @@ class WhisperPCApp(QObject):
         # dictation post-launch doesn't pay the TLS handshake (~200-400ms).
         # Fires only when Groq is actually in the path — either as the STT
         # backend (use_api) or as the polish backend (llm_polish.enabled).
+        # Also schedules a periodic re-warm every 240s so the TLS pool never
+        # goes cold during long idle gaps (mirrors mobile KeepWarmScheduler.kt).
+        self._groq_keepalive_timer = None
         if model_options.get('use_api') or ConfigManager.get_config_value('llm_polish', 'enabled'):
             from threading import Thread
             Thread(target=prewarm_groq_connection, daemon=True).start()
+            self._groq_keepalive_timer = QTimer(self)
+            self._groq_keepalive_timer.setInterval(240_000)  # 240s = 4 min
+            self._groq_keepalive_timer.timeout.connect(self._tick_groq_keepalive)
+            self._groq_keepalive_timer.start()
+
+        # v0.4 PC: warm audio capture + pre-opened ElevenLabs WS session.
+        # Both are driven by WarmupCoordinator:
+        #   - Mic stays cold while screen is locked (no mic-in-use indicator,
+        #     no surprise listening).
+        #   - On screen unlock: warm both (mic InputStream + WS handshake) so
+        #     the first dictation has 0 PortAudio / AGC / WS-handshake latency.
+        #     Eliminates the "first words dropped" bug for the warm case.
+        #   - After `warm_mic_idle_minutes` of no dictation: cool both.
+        #   - Hotkey while cold: legacy per-hotkey path runs (clipping a
+        #     leading syllable). The act of dictating marks activity, so the
+        #     next one is warm again.
+        # Set always_warm_mic=false to disable warm-mic entirely (legacy
+        # behaviour, mic always opened on hotkey).
+        self.audio_capture_service = None
+        self.session_pool = None
+        self.warmup_coordinator = None
+        self.screen_lock_monitor = None
+        if ConfigManager.get_config_value('recording_options', 'always_warm_mic') is not False:
+            recording_options = ConfigManager.get_config_section('recording_options')
+            self.audio_capture_service = AudioCaptureService(
+                sample_rate=int(recording_options.get('sample_rate') or 16000),
+                device=recording_options.get('sound_device'),
+            )
+            # ElevenLabs WS pool — no-ops gracefully when stt_engine != elevenlabs
+            # or key absent. Lives alongside the mic capture in the same cool
+            # / warm cycle.
+            self.session_pool = ElevenLabsSessionPool()
+            self.screen_lock_monitor = ScreenLockMonitor(self)
+            idle_minutes = int(
+                ConfigManager.get_config_value('recording_options', 'warm_mic_idle_minutes')
+                or WarmupCoordinator.DEFAULT_IDLE_MINUTES
+            )
+            self.warmup_coordinator = WarmupCoordinator(
+                self.audio_capture_service,
+                self.session_pool,
+                self.screen_lock_monitor,
+                idle_minutes=idle_minutes,
+                parent=self,
+            )
+            self.warmup_coordinator.start()
 
         self.result_thread = None
         self._recording_started_at = 0.0
@@ -140,6 +219,25 @@ class WhisperPCApp(QObject):
         if not ConfigManager.get_config_value('misc', 'hide_status_window'):
             self.status_window = StatusWindow()
 
+        # Three-state recording bubble — eager singleton (idle = hidden). Shown
+        # on first 'recording' status, hidden explicitly from on_transcription_
+        # complete AFTER typewrite finishes (matches the spec: disappears after
+        # transcription completes AND text is pasted).
+        self.recording_bubble = RecordingBubble()
+        self.recording_bubble.pauseToggleRequested.connect(self._on_bubble_pause_toggle)
+        self.recording_bubble.endRequested.connect(self._on_bubble_end_requested)
+        # Thread-safe state-change channel. Any thread (pynput hook in
+        # on_activation, audio thread via statusSignal, GUI thread itself)
+        # can fire requested.emit(state) — the QueuedConnection guarantees
+        # set_state runs on the GUI thread. Without this, the activation-key
+        # path calls set_state from the pynput hook thread → deadlocks the
+        # hook → mouse stutters and the desktop stops accepting input
+        # (same failure mode as the original popup hang).
+        self._bubble_signal = _BubbleStateSignal(self)
+        self._bubble_signal.requested.connect(
+            self.recording_bubble.set_state, Qt.QueuedConnection,
+        )
+
         self.create_tray_icon()
         self.key_listener.start()  # auto-start listening; no need to press Start in the window
 
@@ -149,6 +247,16 @@ class WhisperPCApp(QObject):
         self._show_request_signal = _ShowRequestSignal(self)
         self._show_request_signal.requested.connect(self._surface_main_window)
         _start_show_event_listener(self._show_request_signal.requested.emit)
+
+    def _tick_groq_keepalive(self):
+        """QTimer slot — fires every 240s. Re-warms the Groq HTTPS pool so
+        the TLS handshake stays primed during long idle gaps. Skipped while
+        a recording is in flight (the actual dictation will warm it). Runs
+        on a daemon thread because TLS handshake can block."""
+        if self.result_thread is not None and self.result_thread.isRunning():
+            return
+        from threading import Thread
+        Thread(target=prewarm_groq_connection, daemon=True).start()
 
     def _surface_main_window(self):
         """Show + raise + activate the main window in response to a duplicate
@@ -220,6 +328,34 @@ class WhisperPCApp(QObject):
             self.key_listener.stop()
         if self.input_simulator:
             self.input_simulator.cleanup()
+        timer = getattr(self, '_groq_keepalive_timer', None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        # Tear down warm-capture stack. Order: coordinator (stops polling +
+        # idle timer) → pool (avoid frames arriving at a stopped session) →
+        # audio service. All are safe to call multiple times; defensive
+        # against partial init.
+        coord = getattr(self, 'warmup_coordinator', None)
+        if coord is not None:
+            try:
+                coord.shutdown()
+            except Exception:
+                pass
+        pool = getattr(self, 'session_pool', None)
+        if pool is not None:
+            try:
+                pool.stop()
+            except Exception:
+                pass
+        svc = getattr(self, 'audio_capture_service', None)
+        if svc is not None:
+            try:
+                svc.stop()
+            except Exception:
+                pass
 
     def _open_transcript_log(self, near_cursor=False):
         if self._history_window is None:
@@ -331,14 +467,77 @@ class WhisperPCApp(QObject):
         if self.result_thread and self.result_thread.isRunning():
             return
 
-        self.result_thread = ResultThread(self.local_model)
+        self.result_thread = ResultThread(
+            self.local_model,
+            audio_capture_service=self.audio_capture_service,
+            session_pool=self.session_pool,
+        )
         if not ConfigManager.get_config_value('misc', 'hide_status_window'):
             self.result_thread.statusSignal.connect(self.status_window.updateStatus)
             self.status_window.closeSignal.connect(self.stop_result_thread)
+        self.result_thread.statusSignal.connect(self._on_recording_status)
         self.result_thread.resultSignal.connect(self.on_transcription_complete)
         self.result_thread.failedSignal.connect(self.on_transcription_failed)
+        # WarmupCoordinator must not race ResultThread for the audio device.
+        # If the legacy per-hotkey path is going to open its own InputStream,
+        # we don't want the coordinator's idle timer firing mid-recording and
+        # calling AudioCaptureService.stop() under it. resume fires after
+        # finished, which is emitted regardless of how run() exits.
+        if self.warmup_coordinator is not None:
+            self.warmup_coordinator.suspend_for_recording()
+            self.result_thread.finished.connect(
+                self.warmup_coordinator.resume_after_recording
+            )
         self._recording_started_at = time.time()
+        # Paint the bubble RED immediately, before the QThread starts. The
+        # ElevenLabs WebSocket handshake inside result_thread.run() takes
+        # ~300-1500ms before statusSignal('recording') would otherwise fire,
+        # and the user perceived that delay as hotkey lag. Showing instantly
+        # closes the gap — actual mic capture still begins when the audio
+        # stream opens, but the visual feedback no longer waits.
+        #
+        # CRITICAL: route via the queued bubble signal because this method
+        # is reachable from on_activation, which runs on the pynput hook
+        # thread. Calling set_state directly here would touch QWidgets from
+        # the wrong thread and deadlock the keyboard hook (mouse stutter +
+        # hotkey unresponsive). See _BubbleStateSignal docstring above.
+        if hasattr(self, '_bubble_signal'):
+            self._bubble_signal.requested.emit('recording')
         self.result_thread.start()
+
+    def _on_recording_status(self, status):
+        """Drive the three-state bubble from ResultThread.statusSignal. The
+        bubble stays visible during 'transcribing' and is hidden explicitly
+        from on_transcription_complete AFTER paste, per the spec ("disappear
+        after transcription completes AND text is pasted"). 'idle' from
+        result_thread fires BEFORE paste, so we ignore it here."""
+        if not hasattr(self, 'recording_bubble') or self.recording_bubble is None:
+            return
+        if status == 'recording':
+            self.recording_bubble.set_state('recording')
+        elif status == 'paused':
+            self.recording_bubble.set_state('paused')
+        elif status == 'transcribing':
+            self.recording_bubble.set_state('transcribing')
+        elif status in ('error', 'no_speech', 'cancel'):
+            self.recording_bubble.set_state('idle')
+
+    def _on_pause_hotkey_gui(self):
+        """Pause/resume hotkey slot, runs on the GUI thread (QueuedConnection).
+        No-op unless a recording is currently in flight."""
+        if self.result_thread and self.result_thread.isRunning():
+            self.result_thread.toggle_pause()
+
+    def _on_bubble_pause_toggle(self):
+        """Single-click on the bubble — same as the pause hotkey."""
+        if self.result_thread and self.result_thread.isRunning():
+            self.result_thread.toggle_pause()
+
+    def _on_bubble_end_requested(self):
+        """Double-click on the bubble — end recording, start transcription.
+        Equivalent to pressing the activation hotkey again while recording."""
+        if self.result_thread and self.result_thread.isRunning():
+            self.result_thread.stop_recording()
 
     def stop_result_thread(self):
         """
@@ -363,12 +562,24 @@ class WhisperPCApp(QObject):
             dd('main.on_transcription_complete', result)
         except Exception:
             pass
+        # Mark activity so the warmup-idle-timer gets another full window of
+        # warm mic. Non-empty result means a real dictation just landed; empty
+        # result (silent recording / API failure) still counts because the
+        # user is actively at the keyboard.
+        if self.warmup_coordinator is not None:
+            self.warmup_coordinator.note_dictation_completed()
         # Empty result reaches here on silent recordings (status overlay shows
         # "Nothing transcribable detected") and on API failures. Skip the paste
         # so we don't clobber the user's clipboard or fire a stray Ctrl+V — but
         # still run beep / re-arm so the activation flow stays consistent.
         if result and result.strip():
             self.input_simulator.typewrite(result)
+
+        # Spec: bubble disappears AFTER transcription completes AND text is
+        # pasted into the focused field. Hide it here so the lifecycle anchor
+        # is correct even when typewrite is skipped (empty/failed result).
+        if hasattr(self, 'recording_bubble') and self.recording_bubble is not None:
+            self.recording_bubble.set_state('idle')
 
         # If the popup is currently open, tail-read the new entry so the user
         # sees it appear at the top without having to click Refresh.
@@ -402,11 +613,42 @@ _SINGLETON_SHOW_EVENT_NAME = 'WhisperPC.ShowEvent.v3'
 _SINGLETON_MUTEX_HANDLE = None
 
 
+def _kernel32_with_signatures():
+    """Return ctypes.windll.kernel32 with restype/argtypes set on every Win32
+    API we use. Required on 64-bit Windows because default ctypes restype is
+    `c_int` (32-bit signed), which truncates HANDLE values (64-bit pointers)
+    and silently corrupts subsequent CloseHandle / SetEvent calls. Symptom
+    of the bug: the duplicate-launch stub never fully exits, leaving a
+    zombie pythonw.exe sibling visible in Task Manager."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    # Already-configured detection — calling this from three places per launch
+    # would otherwise reset the signatures on every call (harmless but wasteful).
+    if getattr(k32, '_whisper_pc_signatures_set', False):
+        return k32
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.OpenEventW.restype = wintypes.HANDLE
+    k32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CreateEventW.restype = wintypes.HANDLE
+    k32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.SetEvent.restype = wintypes.BOOL
+    k32.SetEvent.argtypes = [wintypes.HANDLE]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.GetLastError.restype = wintypes.DWORD
+    k32.GetLastError.argtypes = []
+    k32._whisper_pc_signatures_set = True
+    return k32
+
+
 def _signal_existing_instance() -> bool:
     """Open the named show-event and pulse it. Returns True on success."""
     try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _kernel32_with_signatures()
         EVENT_MODIFY_STATE = 0x0002
         handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, _SINGLETON_SHOW_EVENT_NAME)
         if not handle:
@@ -440,10 +682,9 @@ def _enforce_single_instance() -> None:
     """
     global _SINGLETON_MUTEX_HANDLE
     try:
-        import ctypes
+        kernel32 = _kernel32_with_signatures()
     except Exception:
         return  # be permissive if ctypes is unavailable (non-Windows debug)
-    kernel32 = ctypes.windll.kernel32
     ERROR_ALREADY_EXISTS = 183
     handle = kernel32.CreateMutexW(None, False, _SINGLETON_MUTEX_NAME)
     if not handle:
@@ -473,12 +714,11 @@ def _start_show_event_listener(on_show_callback) -> None:
     background thread; the caller is responsible for marshalling onto the Qt
     main thread (we do that via a queued pyqtSignal in WhisperPCApp)."""
     try:
-        import ctypes
+        kernel32 = _kernel32_with_signatures()
     except Exception:
         return
     from threading import Thread
 
-    kernel32 = ctypes.windll.kernel32
     EVENT_MODIFY_STATE = 0x0002
     SYNCHRONIZE = 0x00100000
     EVENT_ALL_ACCESS = 0x1F0003

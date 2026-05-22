@@ -99,24 +99,26 @@ def _fmt_mem(m):
 # --- Log parsing --------------------------------------------------------------
 
 def _parse_log_slice(content):
-    """Parse polished-transcript blocks from a text slice. Captures both RAW
-    (pre-polish STT output) and POLISHED so the right-click context menu can
-    expose the unpolished text."""
+    """Parse polished-transcript blocks from a text slice. Captures RAW
+    (pre-polish STT output), POLISHED (typed text), and ENGINE (which backend
+    produced the entry — added 2026-05-22)."""
     entries = []
     for block in content.strip().split('\n\n'):
         lines = block.strip().split('\n')
-        timestamp = raw = polished = ''
+        timestamp = raw = polished = engine = ''
         for line in lines:
             s = line.strip()
             if s.startswith('[') and s.endswith(']'):
                 timestamp = s[1:-1]
+            elif s.startswith('ENGINE:'):
+                engine = s[7:].strip()
             elif s.startswith('RAW:'):
                 raw = s[4:].strip()
             elif s.startswith('POLISHED:'):
                 polished = s[9:].strip()
         if polished:
             entries.append({'kind': 'ok', 'timestamp': timestamp,
-                            'text': polished, 'raw': raw})
+                            'text': polished, 'raw': raw, 'engine': engine})
     return entries
 
 
@@ -222,6 +224,7 @@ ErrorRole = Qt.UserRole + 6       # failed only
 RetryStateRole = Qt.UserRole + 7  # 'idle' / 'retrying'
 RetryErrorRole = Qt.UserRole + 8  # last retry-failure reason
 RawRole = Qt.UserRole + 9         # pre-polish STT output (ok only)
+EngineRole = Qt.UserRole + 10     # engine label e.g. 'elevenlabs-stream'
 
 
 class TranscriptHistoryModel(QAbstractListModel):
@@ -270,6 +273,8 @@ class TranscriptHistoryModel(QAbstractListModel):
             return e.get('retry_error', '')
         if role == RawRole:
             return e.get('raw', '')
+        if role == EngineRole:
+            return e.get('engine', '')
         if role == Qt.DisplayRole:
             return e.get('text') or e.get('error') or ''
         return None
@@ -489,14 +494,20 @@ class _RawPolishedDialog(QDialog):
     """Modal showing both RAW (pre-polish STT output) and POLISHED side by side.
     Selectable, copyable text so the user can grab either for re-use."""
 
-    def __init__(self, timestamp, raw, polished, parent=None):
+    def __init__(self, timestamp, raw, polished, parent=None, engine=''):
         super().__init__(parent)
         self.setWindowTitle(f'Transcript — {timestamp}')
-        self.resize(700, 420)
+        self.resize(720, 460)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
+
+        if engine:
+            engine_label = QLabel(f'ENGINE: {engine}')
+            engine_label.setFont(QFont('Segoe UI', 9, QFont.Bold))
+            engine_label.setStyleSheet('color: #1E88E5;')
+            layout.addWidget(engine_label)
 
         raw_label = QLabel('RAW (pre-polish STT output):')
         raw_label.setFont(QFont('Segoe UI', 9, QFont.Bold))
@@ -600,7 +611,9 @@ class TranscriptListView(QListView):
             elif chosen is act_copy_raw:
                 QApplication.clipboard().setText(raw)
             elif chosen is act_view:
-                dlg = _RawPolishedDialog(ts, raw, polished, parent=self.window())
+                engine = idx.data(EngineRole) or ''
+                dlg = _RawPolishedDialog(ts, raw, polished,
+                                          parent=self.window(), engine=engine)
                 dlg.exec_()
             return
 

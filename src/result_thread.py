@@ -37,16 +37,30 @@ class ResultThread(QThread):
     resultSignal = pyqtSignal(str)
     failedSignal = pyqtSignal(str, str)
 
-    def __init__(self, local_model=None):
+    def __init__(self, local_model=None, audio_capture_service=None, session_pool=None):
         """
         Initialize the ResultThread.
 
         :param local_model: Local transcription model (if applicable)
+        :param audio_capture_service: Optional always-warm AudioCaptureService.
+            When alive, capture skips the per-hotkey sd.InputStream open and
+            drains frames from a consumer attached at run() start (pre-roll
+            included). Falls back to per-hotkey open if None / not alive.
+        :param session_pool: Optional ElevenLabsSessionPool. When acquired,
+            replaces the synchronous in-record _open_streaming_session_if_enabled
+            (~300-1500 ms WS handshake) with zero-latency hand-off of a warm
+            session. Falls back to in-record open if None / acquire returns None.
         """
         super().__init__()
         self.local_model = local_model
+        self._audio_capture_service = audio_capture_service
+        self._session_pool = session_pool
         self.is_recording = False
         self.is_running = True
+        # Pause flag — when True, the audio capture loop discards new frames
+        # so the resulting recording omits the paused span. The InputStream
+        # itself keeps running (avoids re-init latency); we just drop frames.
+        self.is_paused = False
         self.sample_rate = None
         self.mutex = QMutex()
         # v0.3.2 PC: streaming-during-recording session. Open before recording
@@ -60,7 +74,45 @@ class ResultThread(QThread):
         """Stop the current recording session."""
         self.mutex.lock()
         self.is_recording = False
+        # If we were paused, transcription must still proceed on whatever
+        # audio was captured before the pause — clearing the flag ensures
+        # the recording loop exits and the captured frames go to transcribe.
+        self.is_paused = False
         self.mutex.unlock()
+
+    def pause_recording(self):
+        """Pause the audio-capture loop. Frames received while paused are
+        discarded so the resulting recording skips over the paused span."""
+        self.mutex.lock()
+        if self.is_recording and not self.is_paused:
+            self.is_paused = True
+            self.mutex.unlock()
+            self.statusSignal.emit('paused')
+        else:
+            self.mutex.unlock()
+
+    def resume_recording(self):
+        """Resume capture after a pause."""
+        self.mutex.lock()
+        if self.is_recording and self.is_paused:
+            self.is_paused = False
+            self.mutex.unlock()
+            self.statusSignal.emit('recording')
+        else:
+            self.mutex.unlock()
+
+    def toggle_pause(self):
+        """Single-shortcut helper: pause if recording, resume if paused."""
+        self.mutex.lock()
+        was_paused = self.is_paused
+        is_rec = self.is_recording
+        self.mutex.unlock()
+        if not is_rec:
+            return
+        if was_paused:
+            self.resume_recording()
+        else:
+            self.pause_recording()
 
     def stop(self):
         """Stop the entire thread execution."""
@@ -73,6 +125,7 @@ class ResultThread(QThread):
     def run(self):
         """Main execution method for the thread."""
         audio_data = None
+        consumer = None
         try:
             if not self.is_running:
                 return
@@ -81,14 +134,40 @@ class ResultThread(QThread):
             self.is_recording = True
             self.mutex.unlock()
 
-            # v0.3.2 PC: open the ElevenLabs streaming session BEFORE recording
-            # starts so PCM frames can flow to the server as we capture them.
-            # Returns None when streaming is disabled (Groq path or toggle off).
-            self._open_streaming_session_if_enabled()
+            # v0.4 PC: prefer the always-warm path — the audio capture service
+            # has been recording into a ring since app startup, so there's no
+            # mic-open / AGC-settle delay here. We just attach a consumer
+            # which seeds with `preroll_ms` of pre-hotkey audio (catching the
+            # leading phoneme when the user starts speaking on the keypress).
+            #
+            # If the service isn't alive (always_warm_mic=false, or open
+            # failed at startup), fall through to the legacy in-record open
+            # in _record_audio.
+            use_warm_capture = (
+                self._audio_capture_service is not None
+                and self._audio_capture_service.is_alive()
+            )
+            if use_warm_capture:
+                preroll_ms = int(
+                    ConfigManager.get_config_value('recording_options', 'preroll_ms') or 200
+                )
+                consumer = self._audio_capture_service.attach_consumer(preroll_ms=preroll_ms)
+                ConfigManager.console_print(
+                    f'Attached warm-capture consumer (preroll={preroll_ms}ms)'
+                )
+
+            # ElevenLabs session: prefer the pre-opened warm session from the
+            # pool (zero latency). Fall back to in-record open (the legacy
+            # ~300-1500 ms blocking handshake) when the pool isn't enabled or
+            # has no warm session ready.
+            self._acquire_warm_session_or_open()
 
             self.statusSignal.emit('recording')
             ConfigManager.console_print('Recording...')
-            audio_data = self._record_audio()
+            if consumer is not None:
+                audio_data = self._record_audio_from_consumer(consumer)
+            else:
+                audio_data = self._record_audio()
 
             if not self.is_running:
                 self._cancel_streaming_session()
@@ -159,6 +238,10 @@ class ResultThread(QThread):
             # already clears self._stream_session on success/failure, but the
             # exception paths above may have left it set.
             self._cancel_streaming_session()
+            # Release the warm-capture consumer (no-op if None or in legacy
+            # path). The InputStream itself stays open — that's the point.
+            if consumer is not None and self._audio_capture_service is not None:
+                self._audio_capture_service.detach_consumer(consumer)
 
     def _persist_failed_recording(self, audio_data, reason):
         """Save audio to failed/<timestamp>.wav and append an entry to failed_log.txt."""
@@ -192,6 +275,37 @@ class ResultThread(QThread):
         self.failedSignal.emit(audio_path, reason)
 
     # ---- v0.3.2 PC: streaming-during-recording helpers ----
+
+    def _acquire_warm_session_or_open(self) -> None:
+        """v0.4 PC: zero-latency session acquisition.
+
+        Tries the ElevenLabsSessionPool first — if a warm session is
+        available, hand-off is instant. Otherwise falls back to the legacy
+        in-record open (blocks up to 2s on the WS handshake) for safety.
+
+        Sets self._stream_session to a ready Session, or None.
+        """
+        self._stream_session = None
+        self._stream_failed_reason = None
+
+        # Pool fast-path — only attempted when the pool is enabled. Returns
+        # an already-ready Session with keepalive running.
+        pool = self._session_pool
+        if pool is not None and pool.is_enabled():
+            warm = pool.acquire()
+            if warm is not None:
+                self._stream_session = warm
+                ConfigManager.console_print(
+                    'Acquired warm streaming session from pool (0ms WS handshake)'
+                )
+                return
+            ConfigManager.console_print(
+                'Session pool had no warm session; falling back to in-record open'
+            )
+
+        # Legacy slow-path: open synchronously in this thread. Same code as
+        # before the pool existed.
+        self._open_streaming_session_if_enabled()
 
     def _open_streaming_session_if_enabled(self) -> None:
         """Open an ElevenLabs RT session if streaming mode is configured.
@@ -334,6 +448,95 @@ class ResultThread(QThread):
 
     # ---- recording loop ----
 
+    def _record_audio_from_consumer(self, consumer):
+        """Drain frames from an AudioCaptureService consumer.
+
+        This is the warm-path counterpart to `_record_audio()`. The InputStream
+        is already open (since app startup); we only consume frames from the
+        consumer's queue. The first frames returned are the pre-roll snapshot
+        (last ~200 ms of audio captured BEFORE the hotkey landed), which is
+        what catches the leading phoneme when the user starts speaking on the
+        keypress.
+
+        Same VAD / silence-detection / dual-write-to-streaming-session logic
+        as `_record_audio()` — only the source of frames differs.
+        """
+        recording_options = ConfigManager.get_config_section('recording_options')
+        self.sample_rate = consumer.sample_rate
+        frame_size = consumer.frame_size
+        frame_duration_ms = frame_size * 1000.0 / consumer.sample_rate
+        silence_duration_ms = recording_options.get('silence_duration') or 900
+        silence_frames = int(silence_duration_ms / frame_duration_ms)
+
+        # 150 ms VAD-warmup skip — same as legacy path. Doesn't drop the
+        # audio itself, just defers VAD's silence-counter so the keypress
+        # click doesn't accidentally trigger "speech detected".
+        initial_frames_to_skip = int(0.15 * consumer.sample_rate / frame_size)
+
+        recording_mode = recording_options.get('recording_mode') or 'continuous'
+        vad = None
+        if recording_mode in ('voice_activity_detection', 'continuous'):
+            vad = webrtcvad.Vad(2)
+            speech_detected = False
+            silent_frame_count = 0
+
+        recording = []
+
+        # Tight poll interval — when stop_recording() sets is_recording=False,
+        # the next iteration must exit promptly so the user-perceived stop is
+        # immediate. 50 ms is fine; with 30 ms frames there's almost always a
+        # frame waiting and the timeout rarely fires.
+        while self.is_running and self.is_recording:
+            frame = consumer.get_frame(timeout=0.05)
+            if frame is None:
+                if consumer.is_closed():
+                    ConfigManager.console_print(
+                        'Capture consumer closed mid-recording; stopping'
+                    )
+                    break
+                continue  # timeout — loop, check is_recording
+
+            if self.is_paused:
+                continue  # discard frame; ring keeps filling in the background
+
+            recording.extend(frame)
+
+            # Dual-write — capture stays in `recording` for the burst fallback /
+            # failed-recording persistence AND streams to ElevenLabs RT in real
+            # time when the session is open.
+            self._feed_streaming_session(frame)
+
+            if initial_frames_to_skip > 0:
+                initial_frames_to_skip -= 1
+                continue
+
+            if vad:
+                if vad.is_speech(frame.tobytes(), self.sample_rate):
+                    silent_frame_count = 0
+                    if not speech_detected:
+                        ConfigManager.console_print("Speech detected.")
+                        speech_detected = True
+                else:
+                    silent_frame_count += 1
+
+                if speech_detected and silent_frame_count > silence_frames:
+                    break
+
+        audio_data = np.array(recording, dtype=np.int16)
+        duration = len(audio_data) / self.sample_rate
+
+        ConfigManager.console_print(
+            f'Recording finished (warm-capture). Size: {audio_data.size} samples, '
+            f'Duration: {duration:.2f} seconds'
+        )
+
+        min_duration_ms = recording_options.get('min_duration') or 100
+        if (duration * 1000) < min_duration_ms:
+            ConfigManager.console_print('Discarded due to being too short.')
+            return None
+
+        return audio_data
+
     def _record_audio(self):
         """
         Record audio from the microphone and save it to a temporary file.
@@ -377,6 +580,13 @@ class ResultThread(QThread):
                 data_ready.clear()
 
                 if len(audio_buffer) < frame_size:
+                    continue
+
+                # PAUSED: discard the buffered frames so the recording skips
+                # the paused span. The InputStream callback keeps firing in
+                # the background; we just don't carry the audio forward.
+                if self.is_paused:
+                    audio_buffer.clear()
                     continue
 
                 # Save frame
