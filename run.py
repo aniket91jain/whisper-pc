@@ -18,9 +18,25 @@ def _peek_singleton_and_signal_if_running() -> bool:
     """
     try:
         import ctypes
+        from ctypes import wintypes
     except Exception:
         return False
     kernel32 = ctypes.windll.kernel32
+    # Set HANDLE restype on every kernel32 entry point we touch. Default
+    # ctypes restype is c_int (32-bit signed), which truncates 64-bit
+    # HANDLE values on x64 Windows — a non-NULL handle gets sign-extended
+    # to a "negative" int, which `if not handle` evaluates to truthy in
+    # the Python sense, but subsequent CloseHandle / SetEvent silently
+    # fail. Symptom: run.py thinks no peer exists, spawns a second
+    # main.py — two Whisper PC instances side-by-side.
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
     SYNCHRONIZE = 0x00100000
     EVENT_MODIFY_STATE = 0x0002
     MUTEX_NAME = 'WhisperPC.SingleInstance.v3'
