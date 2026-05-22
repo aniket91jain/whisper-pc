@@ -72,8 +72,8 @@ To set up and run the project, follow these steps:
 #### 1. Clone the repository:
 
 ```
-git clone https://github.com/savbell/whisper-writer
-cd whisper-writer
+git clone https://github.com/aniket91jain/whisper-pc
+cd whisper-pc
 ```
 
 #### 2. Create a virtual environment and activate it:

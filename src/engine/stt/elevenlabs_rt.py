@@ -1,4 +1,4 @@
-"""ElevenLabs Scribe v2 Realtime client for whisper-writer (PC v0.3).
+"""ElevenLabs Scribe v2 Realtime client for Whisper PC (v0.3).
 
 Ports the mobile `ElevenLabsRtSession.kt` to Python. Two usage patterns:
 

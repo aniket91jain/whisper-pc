@@ -1,16 +1,16 @@
 ---
 id: 21991221-097e-46ae-8532-6fb402f36656
 scope: aniket-private
-title: whisperwriter-config
+title: whisper-pc-config
 type: note
-permalink: my-vault/13-system/vault-reference/whisperwriter-config
+permalink: my-vault/13-system/vault-reference/whisper-pc-config
 ---
 
-# WhisperWriter Config — Recovery Reference
+# Whisper PC Config — Recovery Reference
 
-**Install path:** `C:\Users\anike\Documents\Repos\whisper-writer`
+**Install path:** `C:\Users\anike\Documents\Repos\whisper-pc`
 **Venv:** `venv\` (Python 3.13, created with `python -m venv venv`)
-**Startup shortcut:** `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\WhisperWriter.lnk`
+**Startup shortcut:** `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\WhisperPC.lnk`
   - Target: `venv\Scripts\pythonw.exe run.py`
   - Working dir: the install path above
 
