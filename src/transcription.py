@@ -771,19 +771,29 @@ def _transcribe_via_elevenlabs(audio_data):
 
     raw_text = result.get('text') or ''
     ConfigManager.console_print(f'ElevenLabs RT in {elapsed_ms}ms: "{raw_text.strip()}"')
+    return _finalize_elevenlabs_transcript(raw_text, api_key)
+
+
+def _finalize_elevenlabs_transcript(raw_text: str, api_key: str) -> str:
+    """Post-STT polish + persistence for the ElevenLabs path.
+
+    Shared between record-then-burst (`_transcribe_via_elevenlabs`) and the
+    streaming-during-recording path (`transcribe_streaming_result`). Runs
+    RegexPolish, persists any auto-added proper nouns, schedules the server-
+    side history-delete sweep, and returns the polished final text.
+    """
+    from engine.polish import regex_polish
 
     polish_result = regex_polish.apply(raw_text, toggles=regex_polish.Toggles.from_config())
 
-    # Auto-add from "spelled" trigger — reuse the existing LLM-path persistence.
     if polish_result.dict_additions:
         autoadd_enabled = ConfigManager.get_config_value('llm_polish', 'enable_dict_autoadd_from_spelling')
         if autoadd_enabled is not False:  # default True
             try:
-                _persist_dict_additions(polish_result.dict_additions)  # defined above at L633
+                _persist_dict_additions(polish_result.dict_additions)
             except Exception as e:
                 ConfigManager.console_print(f'dict_add persistence failed: {e}')
 
-    # Schedule the history-delete sweep in the background.
     try:
         from engine.retention import history_delete_worker
         history_delete_worker.schedule_one_shot(api_key)
@@ -791,6 +801,21 @@ def _transcribe_via_elevenlabs(audio_data):
         pass
 
     return polish_result.final_text
+
+
+def transcribe_streaming_result(raw_text: str) -> str:
+    """Pipeline entry point for the streaming-during-recording path.
+
+    The Session in `result_thread._record_audio` already delivered the
+    finalised text from ElevenLabs RT. All we need to do is run the same
+    post-STT polish + persistence that the burst path runs. No STT call here.
+
+    Returns the polished text (empty if input was empty).
+    """
+    if not raw_text or not raw_text.strip():
+        return ''
+    api_key = os.getenv('ELEVENLABS_API_KEY') or ConfigManager.get_config_value('model_options', 'elevenlabs_api_key') or ''
+    return _finalize_elevenlabs_transcript(raw_text, api_key)
 
 
 def _classify_elevenlabs_failure(reason: str) -> str:
@@ -864,15 +889,19 @@ def _build_elevenlabs_keyterms() -> list[str]:
     return out
 
 
-def transcribe(audio_data, local_model=None):
+def transcribe(audio_data, local_model=None, force_groq: bool = False):
     if audio_data is None:
         return ''
 
     # v0.3 routing: check the STT engine pref. If set to elevenlabs, route to
     # the Realtime + RegexPolish path. Default stays groq so v0.1/v0.2 behaviour
     # is preserved until the user opts in.
+    # v0.3.2 PC: force_groq=True lets callers (specifically result_thread when
+    # the streaming session has just failed) skip the ElevenLabs branch and go
+    # straight to Groq. Without this, a failed streaming session falls back to
+    # ElevenLabs *burst* on the same audio — same provider, same failure mode.
     stt_engine = ConfigManager.get_config_value('model_options', 'stt_engine') or 'groq'
-    if stt_engine == 'elevenlabs':
+    if not force_groq and stt_engine == 'elevenlabs':
         return _transcribe_via_elevenlabs(audio_data)
 
     # Skip STT only on a completely dead signal (muted mic, no input device).

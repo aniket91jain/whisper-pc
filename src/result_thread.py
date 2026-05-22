@@ -12,7 +12,7 @@ from PyQt5.QtCore import QThread, QMutex, pyqtSignal
 from collections import deque
 from threading import Event
 
-from transcription import transcribe, TranscriptionAPIError
+from transcription import transcribe, transcribe_streaming_result, TranscriptionAPIError
 from utils import ConfigManager
 
 
@@ -49,6 +49,12 @@ class ResultThread(QThread):
         self.is_running = True
         self.sample_rate = None
         self.mutex = QMutex()
+        # v0.3.2 PC: streaming-during-recording session. Open before recording
+        # starts (when stt_engine=elevenlabs AND stt_streaming_mode=true), fed
+        # per-frame in _record_audio, committed in run() after stop. None when
+        # streaming is disabled or for the Groq path.
+        self._stream_session = None
+        self._stream_failed_reason: str | None = None
 
     def stop_recording(self):
         """Stop the current recording session."""
@@ -75,23 +81,40 @@ class ResultThread(QThread):
             self.is_recording = True
             self.mutex.unlock()
 
+            # v0.3.2 PC: open the ElevenLabs streaming session BEFORE recording
+            # starts so PCM frames can flow to the server as we capture them.
+            # Returns None when streaming is disabled (Groq path or toggle off).
+            self._open_streaming_session_if_enabled()
+
             self.statusSignal.emit('recording')
             ConfigManager.console_print('Recording...')
             audio_data = self._record_audio()
 
             if not self.is_running:
+                self._cancel_streaming_session()
                 return
 
             if audio_data is None:
+                self._cancel_streaming_session()
                 self.statusSignal.emit('idle')
                 return
 
             self.statusSignal.emit('transcribing')
             ConfigManager.console_print('Transcribing...')
 
-            # Time the transcription process
             start_time = time.time()
-            result = transcribe(audio_data, self.local_model)
+            streaming_text = self._commit_streaming_session(audio_data)
+            if streaming_text is not None:
+                # ElevenLabs streaming delivered text; just polish.
+                result = transcribe_streaming_result(streaming_text)
+            else:
+                # No streaming, or streaming failed. Force Groq when streaming
+                # was attempted-and-failed so we don't re-hit ElevenLabs burst
+                # on the same audio that just killed the streaming session.
+                # (Mirrors mobile v0.3.4 forceGroq path.)
+                streaming_failed = self._stream_failed_reason is not None
+                self._stream_failed_reason = None
+                result = transcribe(audio_data, self.local_model, force_groq=streaming_failed)
             end_time = time.time()
 
             transcription_time = end_time - start_time
@@ -132,6 +155,10 @@ class ResultThread(QThread):
             self.resultSignal.emit('')
         finally:
             self.stop_recording()
+            # Make sure no streaming session is left dangling — _commit_*
+            # already clears self._stream_session on success/failure, but the
+            # exception paths above may have left it set.
+            self._cancel_streaming_session()
 
     def _persist_failed_recording(self, audio_data, reason):
         """Save audio to failed/<timestamp>.wav and append an entry to failed_log.txt."""
@@ -163,6 +190,149 @@ class ResultThread(QThread):
             ConfigManager.console_print(f'Could not write failed_log.txt: {e}')
 
         self.failedSignal.emit(audio_path, reason)
+
+    # ---- v0.3.2 PC: streaming-during-recording helpers ----
+
+    def _open_streaming_session_if_enabled(self) -> None:
+        """Open an ElevenLabs RT session if streaming mode is configured.
+
+        Caller (run) calls this before _record_audio so frames can flow as
+        soon as capture starts. Failure to open is silently tolerated — we
+        fall back to the burst path via transcribe(). Sets self._stream_session
+        to a ready Session, or None.
+        """
+        self._stream_session = None
+        self._stream_failed_reason = None
+
+        stt_engine = ConfigManager.get_config_value('model_options', 'stt_engine') or 'groq'
+        if stt_engine != 'elevenlabs':
+            return
+        streaming_enabled = ConfigManager.get_config_value('model_options', 'stt_streaming_mode')
+        if streaming_enabled is False:  # default True
+            return
+        api_key = os.getenv('ELEVENLABS_API_KEY') or ConfigManager.get_config_value('model_options', 'elevenlabs_api_key')
+        if not api_key:
+            ConfigManager.console_print('ElevenLabs key not set; streaming session not opened (will use burst on stop)')
+            return
+
+        try:
+            from engine.stt.elevenlabs_rt import Session
+            from transcription import _build_elevenlabs_keyterms
+            keyterms = _build_elevenlabs_keyterms()
+        except Exception as e:
+            ConfigManager.console_print(f'Streaming session prep failed: {e}; will use burst on stop')
+            return
+
+        from threading import Event as _Event
+        ready_event = _Event()
+
+        def on_ready(ok: bool) -> None:
+            if ok:
+                ready_event.set()
+            else:
+                # Mirrors mobile v0.3.6: session.onFailure fires onReadyCallback(false)
+                # for mid-recording deaths too. Mark a reason so the eventual
+                # stop path falls through to burst/Groq instead of trying to
+                # commit a dead session.
+                self._stream_failed_reason = 'ElevenLabs streaming session ended'
+                ready_event.set()  # unblock the caller
+
+        session = Session(api_key, keyterms)
+        session.start(on_ready=on_ready)
+        # Wait briefly for session_started. If it doesn't come, we still let
+        # the recording proceed — _record_audio will treat the session as dead
+        # and we'll fall back at stop time.
+        if not ready_event.wait(timeout=2.0):
+            ConfigManager.console_print('Streaming session not ready within 2s; falling back to burst on stop')
+            session.cancel()
+            return
+        if self._stream_failed_reason:
+            ConfigManager.console_print('Streaming session failed to open; falling back to burst on stop')
+            session.cancel()
+            return
+
+        self._stream_session = session
+        ConfigManager.console_print(f'Streaming session opened (keyterms={len(keyterms)})')
+
+    def _feed_streaming_session(self, pcm_frame: np.ndarray) -> None:
+        """Forward one captured PCM frame to the streaming session, if any."""
+        session = self._stream_session
+        if session is None:
+            return
+        if not session.is_ready():
+            # Session died during recording — note the reason once and stop
+            # trying to feed it. Burst fallback will pick up at stop.
+            if not self._stream_failed_reason:
+                self._stream_failed_reason = 'ElevenLabs streaming session died mid-recording'
+                ConfigManager.console_print('Streaming session died mid-recording; switching to burst-on-stop')
+            self._stream_session = None
+            return
+        try:
+            session.send_audio_chunk(pcm_frame.tobytes(), commit=False)
+        except Exception as e:
+            ConfigManager.console_print(f'Streaming send failed: {e}; switching to burst-on-stop')
+            self._stream_failed_reason = f'send failed: {e}'
+            self._stream_session = None
+
+    def _commit_streaming_session(self, full_audio: np.ndarray) -> str | None:
+        """Commit the streaming session and wait for the final transcript.
+
+        Returns the finalised text string when streaming delivered usable
+        output. Returns None when streaming wasn't active or it failed —
+        caller should fall through to the burst path on `full_audio`.
+        """
+        session = self._stream_session
+        if session is None:
+            return None
+        self._stream_session = None
+
+        from threading import Event as _Event
+        done_event = _Event()
+        result_holder: dict = {}
+
+        def on_result(r: dict) -> None:
+            result_holder.update(r)
+            done_event.set()
+
+        try:
+            session.commit(on_result)
+        except Exception as e:
+            ConfigManager.console_print(f'Streaming commit raised: {e}; falling back to burst')
+            return None
+
+        # Mobile uses a 5s in-session watchdog plus a 7s service-level safety
+        # net. Mirror that here: wait up to 7s for the final transcript.
+        if not done_event.wait(timeout=7.0):
+            ConfigManager.console_print('Streaming commit timed out (>7s); falling back to burst')
+            try:
+                session.cancel()
+            except Exception:
+                pass
+            return None
+
+        if result_holder.get('error'):
+            ConfigManager.console_print(f'Streaming commit failed: {result_holder["error"]}; falling back to burst')
+            return None
+
+        text = (result_holder.get('text') or '').strip()
+        if not text:
+            ConfigManager.console_print('Streaming commit returned empty text; falling back to burst')
+            return None
+
+        ConfigManager.console_print(f'Streaming delivered {len(text)} chars; skipping burst STT')
+        return text
+
+    def _cancel_streaming_session(self) -> None:
+        """Abort streaming without committing (user cancelled / empty audio)."""
+        session = self._stream_session
+        if session is not None:
+            try:
+                session.cancel()
+            except Exception:
+                pass
+        self._stream_session = None
+
+    # ---- recording loop ----
 
     def _record_audio(self):
         """
@@ -213,6 +383,11 @@ class ResultThread(QThread):
                 frame = np.array(list(audio_buffer), dtype=np.int16)
                 audio_buffer.clear()
                 recording.extend(frame)
+
+                # v0.3.2: dual-write — capture stays in `recording` (for the
+                # burst fallback / failed-recording persistence) AND streams
+                # to ElevenLabs RT in real time when the session is open.
+                self._feed_streaming_session(frame)
 
                 # Avoid trying to detect voice in initial frames
                 if initial_frames_to_skip > 0:

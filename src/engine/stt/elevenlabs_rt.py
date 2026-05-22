@@ -61,6 +61,12 @@ def _build_url(keyterms: List[str]) -> str:
         ("model_id", MODEL_ID),
         ("audio_format", f"pcm_{SAMPLE_RATE}"),
         ("commit_strategy", "manual"),
+        # no_verbatim hints to the server to drop disfluencies; documented in
+        # the ElevenLabs SDK source. One bench-audio comparison showed near-
+        # identical output, but the user has decided to keep it on for
+        # potentially-helpful effect on heavier-disfluency inputs we haven't
+        # tested. Cost is zero.
+        ("no_verbatim", "true"),
     ]
     for term in keyterms:
         term = term.strip()
@@ -103,6 +109,16 @@ class Session:
         self._keepalive_thread: Optional[threading.Thread] = None
         self._t_start = 0.0
         self._t_commit = 0.0
+
+        # PC mirror of mobile v0.3.5: Scribe v2 RT emits `committed_transcript`
+        # per utterance segment, not per session. A 2-3s mid-dictation pause
+        # triggers a server-initiated finalise even under commit_strategy=manual.
+        # Pre-fix, we'd close() on every committed_transcript and drop the
+        # segment text on the floor when no callback was waiting yet (server-
+        # initiated). Now we accumulate into _segments and only close on the
+        # user-initiated commit.
+        self._segments: list[str] = []
+        self._segments_lock = threading.Lock()
 
     # ---- public API ----
 
@@ -150,30 +166,58 @@ class Session:
 
         Callback fires (on the WS thread) with a dict: {"text": str|None, "error": str|None}
 
-        v0.3.1 bug fix: arms a 15s watchdog. If the server doesn't respond,
+        v0.3.1 bug fix: arms a 5s watchdog. If the server doesn't respond,
         the callback fires with an error so the caller's fallback (burst)
         path can take over instead of hanging indefinitely. Mirrors the
         commitWatchdog in mobile's ElevenLabsRtSession.kt.
+
+        PC mirror of mobile v0.3.6: if the WS is already dead (server
+        segmented mid-recording and closed) but we have stashed segment text,
+        deliver it immediately instead of waiting for the watchdog.
         """
+        if self._closed.is_set() or not self._ready.is_set():
+            stashed = self._joined_segments()
+            if stashed:
+                _LOG.info(f"commit: WS dead, delivering {len(stashed)} chars of stashed segment text")
+                try:
+                    on_result({"text": stashed, "error": None})
+                except Exception as e:
+                    _LOG.warning(f"on_result raised on stashed-text delivery: {e}")
+                return
+
         self._on_result = on_result
         self._t_commit = time.monotonic()
         threading.Timer(COMMIT_TIMEOUT_S, self._on_commit_timeout).start()
         self.send_audio_chunk(b"", commit=True)
 
+    def _joined_segments(self) -> str:
+        """Return all accumulated segment text joined with single spaces."""
+        with self._segments_lock:
+            return " ".join(s for s in self._segments if s)
+
     def _on_commit_timeout(self) -> None:
         with self._lock:
             cb = self._on_result
             self._on_result = None
-        if cb is not None:
-            _LOG.warning(f"commit watchdog fired after {COMMIT_TIMEOUT_S}s; firing failure")
-            try:
+        if cb is None:
+            return
+
+        # PC mirror of mobile v0.3.5: prefer stashed segment text over failure
+        # when the user committed after the server had already given us some.
+        stashed = self._joined_segments()
+        try:
+            if stashed:
+                _LOG.warning(f"commit watchdog fired; delivering {len(stashed)} chars of stashed segments instead of failing")
+                cb({"text": stashed, "error": None})
+            else:
+                _LOG.warning(f"commit watchdog fired after {COMMIT_TIMEOUT_S}s; firing failure")
                 cb({
                     "text": None,
                     "error": f"ElevenLabs commit timed out (no committed_transcript in {COMMIT_TIMEOUT_S:.0f}s)",
                 })
-            except Exception as e:
-                _LOG.warning(f"commit timeout callback raised: {e}")
-            self.cancel()
+        except Exception as e:
+            _LOG.warning(f"commit timeout callback raised: {e}")
+        self.cancel()
 
     def cancel(self) -> None:
         """Abort without committing — user pressed cancel mid-dictation."""
@@ -258,18 +302,40 @@ class Session:
         elif mtype == "partial_transcript":
             pass  # ignored on PC v0.3 (no live UI rendering)
         elif mtype == "committed_transcript":
-            text = (payload.get("text") or "").strip()
+            segment_text = (payload.get("text") or "").strip()
             eoa_to_final_ms = (
                 int((time.monotonic() - self._t_commit) * 1000)
                 if self._t_commit else -1
             )
-            _LOG.info(f"RT committed_transcript chars={len(text)} eoa→final={eoa_to_final_ms}ms")
-            # Atomically take the callback so the commit-timeout watchdog can't race.
+
+            # Append to the segment buffer first. Then atomically take the
+            # callback to discriminate user vs server initiated.
+            with self._segments_lock:
+                if segment_text:
+                    self._segments.append(segment_text)
+                combined = " ".join(s for s in self._segments if s)
+
             with self._lock:
                 cb = self._on_result
                 self._on_result = None
-            if cb is not None:
-                cb({"text": text, "error": None})
+            server_initiated = cb is None
+            _LOG.info(
+                f"RT committed_transcript chars={len(segment_text)} "
+                f"eoa→final={eoa_to_final_ms}ms serverInitiated={server_initiated} "
+                f"total_segments={len(self._segments)}"
+            )
+
+            if server_initiated:
+                # PC mirror of mobile v0.3.5: don't close on server-initiated
+                # commits. The WS may stay alive for more segments; if it
+                # doesn't, _on_close will deliver the stashed text.
+                return
+
+            # User-initiated commit: deliver the accumulated text and tear down.
+            try:
+                cb({"text": combined, "error": None})
+            except Exception as e:
+                _LOG.warning(f"on_result raised: {e}")
             self._closed.set()
             self._stop_keepalive()
             try:
@@ -298,8 +364,14 @@ class Session:
         if self._on_ready:
             self._on_ready(False)
             self._on_ready = None
+        # PC mirror of mobile v0.3.5: prefer stashed segments over hard fail.
         if self._on_result:
-            self._on_result({"text": None, "error": f"WS error: {error}"})
+            stashed = self._joined_segments()
+            if stashed:
+                _LOG.info(f"WS error but delivering {len(stashed)} chars of stashed segments")
+                self._on_result({"text": stashed, "error": None})
+            else:
+                self._on_result({"text": None, "error": f"WS error: {error}"})
             self._on_result = None
         self._closed.set()
         self._stop_keepalive()
@@ -308,10 +380,19 @@ class Session:
         _LOG.info(f"RT WS closed code={close_code} reason={close_msg}")
         self._ready.clear()
         if self._on_result and not self._closed.is_set():
-            self._on_result({
-                "text": None,
-                "error": f"WS closed before committed_transcript (code={close_code})",
-            })
+            # PC mirror of mobile v0.3.5: if we have stashed segments from
+            # prior server-initiated commits, deliver them on close rather
+            # than fail. This handles the case where server commits a segment
+            # then immediately closes the WS.
+            stashed = self._joined_segments()
+            if stashed:
+                _LOG.info(f"WS closed (code={close_code}) but delivering {len(stashed)} chars of stashed segments")
+                self._on_result({"text": stashed, "error": None})
+            else:
+                self._on_result({
+                    "text": None,
+                    "error": f"WS closed before committed_transcript (code={close_code})",
+                })
             self._on_result = None
         self._closed.set()
         self._stop_keepalive()
@@ -350,6 +431,12 @@ def transcribe_burst(pcm_bytes: bytes, api_key: str, keyterms: List[str], timeou
         return {"text": None, "error": "Timeout waiting for session_started"}
 
     # Burst the audio in 100ms chunks. Server will buffer + process.
+    # Send commit=false on all chunks here; we'll send the explicit commit
+    # message via session.commit() after the loop so the callback is wired
+    # BEFORE the commit hits the server. Otherwise we race the server's
+    # committed_transcript against our callback registration, and with the
+    # new segment accumulator that race can stash the result and leave the
+    # caller waiting forever.
     chunk_size = SAMPLE_RATE * 2 // 10  # 100ms of PCM16 mono
     offset = 0
     total = len(pcm_bytes)
@@ -357,15 +444,9 @@ def transcribe_burst(pcm_bytes: bytes, api_key: str, keyterms: List[str], timeou
         end = min(offset + chunk_size, total)
         chunk = pcm_bytes[offset:end]
         offset = end
-        is_last = offset >= total
-        session.send_audio_chunk(chunk, commit=is_last)
+        session.send_audio_chunk(chunk, commit=False)
 
-    # If we never had a non-empty last chunk to attach commit to:
-    if not session._commit_sent:
-        session.commit(on_result)
-    else:
-        # commit flag was already on the last data chunk; wire callback.
-        session._on_result = on_result
+    session.commit(on_result)
 
     if not done.wait(timeout=timeout_s):
         session.cancel()
