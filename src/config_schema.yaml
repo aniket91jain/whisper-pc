@@ -215,10 +215,11 @@ post_processing:
     type: bool
     description: "Set to true to convert the transcribed text to lowercase."
   input_method:
-    value: pynput
+    value: clipboard
     type: str
-    description: "The method to use for simulating keyboard input."
+    description: "How the transcribed text is delivered to the focused text field. 'clipboard' (recommended) copies and Ctrl+V's once — instant for any length. 'pynput' types character-by-character with `writing_key_press_delay` between keystrokes — visible char-by-char on long dictations. 'ydotool'/'dotool' are Linux-only fallbacks."
     options:
+      - clipboard
       - pynput
       - ydotool
       - dotool
