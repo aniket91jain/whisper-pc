@@ -26,6 +26,35 @@ model_options:
     type: bool
     description: "When stt_engine = elevenlabs, stream audio to the server while you're still talking. Off = burst after release (slower for long dictations). No effect when stt_engine = groq."
 
+# v0.3.1 individual regex-polish toggles. Each step of the ElevenLabs-path
+# post-processor can be turned off independently. All default ON. Only takes
+# effect when stt_engine = elevenlabs (the Groq path uses LLM polish).
+regex_polish:
+  proper_nouns:
+    value: true
+    type: bool
+    description: "Fix common proper-noun mishears (\"owner res\" → \"OwnerRez\", \"asa gaon\" → \"Assagao\")."
+  spoken_punctuation:
+    value: true
+    type: bool
+    description: "Translate spoken commands to symbols (\"comma\" → \",\", \"new paragraph\" → blank line)."
+  alphanumeric:
+    value: true
+    type: bool
+    description: "Collapse NATO phonetic + digits into codes (\"alpha bravo 1 2 3\" → \"AB123\")."
+  email:
+    value: true
+    type: bool
+    description: "Convert email-shaped phrases (\"aniket at gmail dot com\" → \"aniket@gmail.com\")."
+  spelling:
+    value: true
+    type: bool
+    description: "Capture spelled-out words (\"X spelled A-B-C\" → \"X\") and auto-add to the dictionary."
+  scratch:
+    value: true
+    type: bool
+    description: "Honor \"scratch that\" / \"delete that\" voice commands (replace preceding phrase)."
+
   use_api:
     value: false
     type: bool

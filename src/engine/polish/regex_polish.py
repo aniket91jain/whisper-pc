@@ -33,46 +33,82 @@ class Result:
     dict_additions: list[str] = field(default_factory=list)
 
 
-def apply(raw_from_stt: str) -> Result:
+@dataclass
+class Toggles:
+    """v0.3.1: per-sub-module enable flags. All default True; callers pass
+    `Toggles.from_config()` to honour user settings."""
+    proper_nouns: bool = True
+    spoken_punctuation: bool = True
+    alphanumeric: bool = True
+    email: bool = True
+    spelling: bool = True
+    scratch: bool = True
+
+    @classmethod
+    def from_config(cls) -> "Toggles":
+        from utils import ConfigManager
+        def get(k: str) -> bool:
+            v = ConfigManager.get_config_value("regex_polish", k)
+            return True if v is None else bool(v)
+        return cls(
+            proper_nouns=get("proper_nouns"),
+            spoken_punctuation=get("spoken_punctuation"),
+            alphanumeric=get("alphanumeric"),
+            email=get("email"),
+            spelling=get("spelling"),
+            scratch=get("scratch"),
+        )
+
+
+def apply(raw_from_stt: str, toggles: Toggles | None = None) -> Result:
     if not raw_from_stt or not raw_from_stt.strip():
         return Result("", [])
+    if toggles is None:
+        toggles = Toggles()
 
     s = raw_from_stt
 
-    # Step 1: proper-noun mishears (idempotent, ~30 entries, sub-microsecond).
-    s = proper_noun_fixes.apply(s)
+    # Step 1: proper-noun mishears.
+    if toggles.proper_nouns:
+        s = proper_noun_fixes.apply(s)
 
     # Step 2: spoken punctuation — reuses the existing PC-side normalizer.
-    # Import inside the function to avoid a circular dep with transcription.py
-    # (which we will modify to call into regex_polish from its alt path).
-    from transcription import _normalize_spoken_symbols
-    s = _normalize_spoken_symbols(s)
+    if toggles.spoken_punctuation:
+        from transcription import _normalize_spoken_symbols
+        s = _normalize_spoken_symbols(s)
 
-    # Step 2.5: post-sentence-terminator voice formatting that the spoken-
-    # symbols pass misses. E.g. "First thought. new paragraph Second."
-    s = re.sub(
-        r"([.!?])\s+new\s+paragraph\s+",
-        lambda m: m.group(1) + "[blank line]",
-        s, flags=re.IGNORECASE,
-    )
-    s = re.sub(
-        r"([.!?])\s+new\s+line\s+",
-        lambda m: m.group(1) + "[newline]",
-        s, flags=re.IGNORECASE,
-    )
+        # Step 2.5: post-sentence-terminator voice formatting that the spoken-
+        # symbols pass misses. E.g. "First thought. new paragraph Second."
+        s = re.sub(
+            r"([.!?])\s+new\s+paragraph\s+",
+            lambda m: m.group(1) + "[blank line]",
+            s, flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r"([.!?])\s+new\s+line\s+",
+            lambda m: m.group(1) + "[newline]",
+            s, flags=re.IGNORECASE,
+        )
 
     # Step 3: alphanumeric / NATO collapse.
-    s = alphanumeric_nato.normalize(s)
+    if toggles.alphanumeric:
+        s = alphanumeric_nato.normalize(s)
 
     # Step 4: email shorthand.
-    s = email_shorthand.apply(s)
+    if toggles.email:
+        s = email_shorthand.apply(s)
 
     # Step 5: spelling capture — may emit DICT_ADD words.
-    spelling_result = spelling_capture.apply(s)
-    s = spelling_result.cleaned
+    if toggles.spelling:
+        spelling_result = spelling_capture.apply(s)
+        s = spelling_result.cleaned
+        dict_words = spelling_result.new_dict_words
+    else:
+        dict_words = []
 
     # Step 6: scratch handler.
-    s = scratch_handler.apply(s)
+    if toggles.scratch:
+        s = scratch_handler.apply(s)
 
     # Step 7: expand voice-format placeholders to real newlines.
     s = re.sub(r"\s*\[blank\s*line\]\s*", "\n\n", s)
@@ -83,7 +119,7 @@ def apply(raw_from_stt: str) -> Result:
     # double-space collapse, space-before-punct).
     s = _final_cleanup(s)
 
-    return Result(final_text=s, dict_additions=spelling_result.new_dict_words)
+    return Result(final_text=s, dict_additions=dict_words)
 
 
 def _final_cleanup(s: str) -> str:

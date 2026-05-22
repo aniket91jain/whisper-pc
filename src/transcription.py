@@ -769,7 +769,7 @@ def _transcribe_via_elevenlabs(audio_data):
     raw_text = result.get('text') or ''
     ConfigManager.console_print(f'ElevenLabs RT in {elapsed_ms}ms: "{raw_text.strip()}"')
 
-    polish_result = regex_polish.apply(raw_text)
+    polish_result = regex_polish.apply(raw_text, toggles=regex_polish.Toggles.from_config())
 
     # Auto-add from "spelled" trigger — reuse the existing LLM-path persistence.
     if polish_result.dict_additions:

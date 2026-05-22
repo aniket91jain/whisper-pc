@@ -51,6 +51,7 @@ SAMPLE_RATE = 16000
 MAX_KEYTERMS = 50
 MAX_KEYTERM_LEN = 20
 KEEPALIVE_INTERVAL_S = 10  # ElevenLabs RT idle timeout is ~15s; ping every 10s
+COMMIT_TIMEOUT_S = 15.0     # max wait for committed_transcript after commit sent
 
 
 def _build_url(keyterms: List[str]) -> str:
@@ -146,9 +147,31 @@ class Session:
         """Mark the session complete and await `committed_transcript`.
 
         Callback fires (on the WS thread) with a dict: {"text": str|None, "error": str|None}
+
+        v0.3.1 bug fix: arms a 15s watchdog. If the server doesn't respond,
+        the callback fires with an error so the caller's fallback (burst)
+        path can take over instead of hanging indefinitely. Mirrors the
+        commitWatchdog in mobile's ElevenLabsRtSession.kt.
         """
         self._on_result = on_result
+        self._t_commit = time.monotonic()
+        threading.Timer(COMMIT_TIMEOUT_S, self._on_commit_timeout).start()
         self.send_audio_chunk(b"", commit=True)
+
+    def _on_commit_timeout(self) -> None:
+        with self._lock:
+            cb = self._on_result
+            self._on_result = None
+        if cb is not None:
+            _LOG.warning(f"commit watchdog fired after {COMMIT_TIMEOUT_S}s; firing failure")
+            try:
+                cb({
+                    "text": None,
+                    "error": f"ElevenLabs commit timed out (no committed_transcript in {COMMIT_TIMEOUT_S:.0f}s)",
+                })
+            except Exception as e:
+                _LOG.warning(f"commit timeout callback raised: {e}")
+            self.cancel()
 
     def cancel(self) -> None:
         """Abort without committing — user pressed cancel mid-dictation."""
@@ -239,9 +262,12 @@ class Session:
                 if self._t_commit else -1
             )
             _LOG.info(f"RT committed_transcript chars={len(text)} eoa→final={eoa_to_final_ms}ms")
-            if self._on_result:
-                self._on_result({"text": text, "error": None})
+            # Atomically take the callback so the commit-timeout watchdog can't race.
+            with self._lock:
+                cb = self._on_result
                 self._on_result = None
+            if cb is not None:
+                cb({"text": text, "error": None})
             self._closed.set()
             self._stop_keepalive()
             try:
@@ -251,9 +277,11 @@ class Session:
         elif mtype in ("input_error", "error"):
             err = f"{payload.get('error', 'unknown')}: {payload.get('message', message)[:200]}"
             _LOG.warning(f"RT error: {err}")
-            if self._on_result:
-                self._on_result({"text": None, "error": err})
+            with self._lock:
+                cb = self._on_result
                 self._on_result = None
+            if cb is not None:
+                cb({"text": None, "error": err})
             self._closed.set()
             self._stop_keepalive()
             try:
