@@ -479,11 +479,14 @@ class WhisperPCApp(QObject):
         self.result_thread.resultSignal.connect(self.on_transcription_complete)
         self.result_thread.failedSignal.connect(self.on_transcription_failed)
         # WarmupCoordinator must not race ResultThread for the audio device.
-        # If the legacy per-hotkey path is going to open its own InputStream,
-        # we don't want the coordinator's idle timer firing mid-recording and
-        # calling AudioCaptureService.stop() under it. resume fires after
-        # finished, which is emitted regardless of how run() exits.
+        # If the idle timer or a lock event fires mid-recording, the coordinator
+        # would otherwise call AudioCaptureService.stop() under the active
+        # consumer — which silently truncates the user's audio (see 2026-05-23
+        # bug: dictation cut off at "If I want some-." exactly 10min after the
+        # previous one finished). The dictation-start counts as activity, so
+        # reset the idle window now; suspend the cool path until finished fires.
         if self.warmup_coordinator is not None:
+            self.warmup_coordinator.note_dictation_started()
             self.warmup_coordinator.suspend_for_recording()
             self.result_thread.finished.connect(
                 self.warmup_coordinator.resume_after_recording

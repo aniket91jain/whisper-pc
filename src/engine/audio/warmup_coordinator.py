@@ -61,6 +61,12 @@ class WarmupCoordinator(QObject):
         self._monitor = screen_lock_monitor
         self._is_warm = False
         self._suspended_for_recording = False
+        # When True, a cool event was requested while a dictation was in
+        # flight. We don't honour it immediately (that would yank the mic
+        # out from under the active recording — see the 2026-05-23 bug where
+        # the idle timer fired mid-dictation and silently truncated audio).
+        # Re-evaluated in resume_after_recording once the dictation finishes.
+        self._cool_pending = False
         self._idle_minutes = int(idle_minutes)
 
         self._idle_timer = QTimer(self)
@@ -102,6 +108,20 @@ class WarmupCoordinator(QObject):
 
     # ---- external events ----
 
+    def note_dictation_started(self) -> None:
+        """A dictation is starting. Counts as activity — reset the idle
+        timer so we don't time-out the warm window mid-recording.
+
+        Pair with `suspend_for_recording`: this resets the timer; that
+        also blocks the cool path from running. Both are needed because
+        a long dictation could outlast the timer that was already running."""
+        if self._monitor is not None and self._monitor.is_locked():
+            return
+        # Reset the timer to a fresh full window. Don't call _warm() — the
+        # service is presumably already warm (that's why we're not in the
+        # legacy cold path); and suspend_for_recording was just called.
+        self._idle_timer.start()
+
     def note_dictation_completed(self) -> None:
         """A hotkey-driven dictation just finished. Reset the idle timer
         and (if currently cold and unlocked) start warming for the next
@@ -111,16 +131,35 @@ class WarmupCoordinator(QObject):
         self._warm()  # idempotent: warm if not already warm + reset idle timer
 
     def suspend_for_recording(self) -> None:
-        """ResultThread is starting up in the legacy per-hotkey path (mic was
-        cold). Hold off on warming until the recording finishes — don't fight
-        for the audio device while it's in use."""
+        """ResultThread is starting up. Hold off on cooling — if the idle
+        timer or a lock event fires mid-dictation, defer it via _cool_pending
+        rather than killing the mic under the active recording.
+
+        Symptom of the bug this guards against: dictation silently truncates
+        mid-sentence, transcription fires on whatever was captured up to that
+        point. Fixed 2026-05-23 after a 10-min-idle expiry interrupted a
+        live dictation."""
         self._suspended_for_recording = True
 
     def resume_after_recording(self) -> None:
-        """ResultThread has stopped using its own InputStream. Resume normal
-        warmup logic. Called from `on_transcription_complete` (and the failure
-        path)."""
+        """ResultThread has stopped. Resume normal warmup logic; honour any
+        cool that was deferred during the dictation. Called from
+        `result_thread.finished` (runs on the Qt main thread)."""
         self._suspended_for_recording = False
+        # If a cool was requested mid-dictation, re-evaluate now that we
+        # know the current state. Don't trust the stale flag — re-check
+        # the actual lock status; if the user is still here (unlocked),
+        # they just dictated, which extends the warm window.
+        if self._cool_pending:
+            self._cool_pending = False
+            if self._monitor is not None and self._monitor.is_locked():
+                self._cool()
+                return
+            # Idle-timer-driven cool, deferred and now resolved by activity.
+            # _warm() restarts the timer with a fresh window.
+            self._warm()
+            return
+        # Normal path — no deferred cool to clear.
         if self._monitor is not None and self._monitor.is_locked():
             return
         self._warm()
@@ -165,6 +204,15 @@ class WarmupCoordinator(QObject):
         self._is_warm = True
 
     def _cool(self) -> None:
+        if self._suspended_for_recording:
+            # Active dictation — we'd close the InputStream out from under
+            # the consumer, truncating the user's audio mid-word. Defer
+            # until resume_after_recording, which will re-evaluate state.
+            ConfigManager.console_print(
+                'WarmupCoordinator: cool requested mid-dictation; deferring'
+            )
+            self._cool_pending = True
+            return
         self._idle_timer.stop()
         if self._pool is not None:
             try:
@@ -177,6 +225,7 @@ class WarmupCoordinator(QObject):
             except Exception:
                 pass
         self._is_warm = False
+        self._cool_pending = False
 
     def is_warm(self) -> bool:
         return self._is_warm
