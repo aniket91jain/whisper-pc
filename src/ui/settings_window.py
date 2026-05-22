@@ -57,7 +57,10 @@ class SettingsWindow(BaseWindow):
     settings_saved = pyqtSignal()
 
     def __init__(self):
-        super().__init__('Settings', 760, 680)
+        # background_alpha=255 forces the BaseWindow paint to be fully opaque
+        # — the inherited default of 220 (~86%) makes Settings look slightly
+        # transparent, which the user explicitly didn't want.
+        super().__init__('Settings', 760, 680, background_alpha=255)
 
         # We don't auto-iterate config_schema anymore. Each setting widget is
         # registered explicitly in _register so save/reset/visibility can be
