@@ -1,5 +1,31 @@
 # Configuration options for the Whisper models
 model_options:
+  # v0.3: which STT backend to use.
+  #   "groq"       — Whisper-large-v3-turbo via Groq + Llama polish (v0.1/v0.2)
+  #   "elevenlabs" — Scribe v2 Realtime + client-side RegexPolish (v0.3+)
+  stt_engine:
+    value: groq
+    type: str
+    description: "Which STT backend to use. groq = Whisper + Llama polish (legacy). elevenlabs = ElevenLabs Scribe v2 Realtime + RegexPolish (v0.3 default once you've added the key)."
+    options:
+      - groq
+      - elevenlabs
+
+  # v0.3 ElevenLabs API key. Stored here for the settings UI to find — the
+  # actual env-based key in .env (ELEVENLABS_API_KEY) is also checked at
+  # runtime and takes precedence when present (consistent with how Groq's
+  # key works on PC).
+  elevenlabs_api_key:
+    value: null
+    type: str
+    description: "Your ElevenLabs API key for Scribe v2 Realtime. Required when stt_engine = elevenlabs. The .env ELEVENLABS_API_KEY takes precedence when set."
+
+  # v0.3 streaming-during-recording toggle for the elevenlabs engine.
+  stt_streaming_mode:
+    value: true
+    type: bool
+    description: "When stt_engine = elevenlabs, stream audio to the server while you're still talking. Off = burst after release (slower for long dictations). No effect when stt_engine = groq."
+
   use_api:
     value: false
     type: bool

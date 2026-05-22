@@ -552,7 +552,25 @@ def llm_polish(transcription):
             **extra_kwargs,
         )
         polished = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
         ConfigManager.console_print(f'LLM polish: raw="{transcription.strip()}" → polished="{polished}"')
+
+        # Detect silent token-budget truncation. With reasoning models the
+        # hidden reasoning tokens share max_tokens with the visible output, so
+        # long dictations can hit the cap and return mid-sentence. finish_reason
+        # 'length' means the response was cut short by max_tokens.
+        if finish_reason == 'length':
+            ConfigManager.console_print(
+                f'LLM polish TRUNCATED by max_tokens (finish_reason=length). '
+                f'raw_chars={len(transcription)} polished_chars={len(polished or "")}'
+            )
+            try:
+                from dict_diag import dd
+                dd('polish.truncated_by_max_tokens', polished,
+                   raw_chars=len(transcription),
+                   polished_chars=len(polished or ''))
+            except Exception:
+                pass
 
         try:
             import datetime
@@ -589,8 +607,23 @@ def llm_polish(transcription):
             ConfigManager.console_print(
                 f'LLM polish rejected ({repair.rejection_reason}); returning raw.'
             )
+            try:
+                from dict_diag import dd
+                dd('polish.rejected_return_raw', transcription,
+                   reason=repair.rejection_reason,
+                   similarity=repair.similarity,
+                   overlap=repair.overlap)
+            except Exception:
+                pass
             return transcription
 
+        try:
+            from dict_diag import dd
+            dd('polish.final_text', repair.final_text,
+               similarity=repair.similarity,
+               overlap=repair.overlap)
+        except Exception:
+            pass
         return repair.final_text
     except Exception as e:
         ConfigManager.console_print(f'LLM polish error (returning raw transcription): {e}')
@@ -681,9 +714,128 @@ def post_process_transcription(transcription, skip_polish: bool = False):
     return transcription
 
 
+def _transcribe_via_elevenlabs(audio_data):
+    """v0.3 PC path: ElevenLabs Scribe v2 Realtime + client-side RegexPolish.
+
+    No LLM polish. ElevenLabs handles capitalisation, punctuation, numbers,
+    fillers, Hindi natively. RegexPolish (in engine/polish/regex_polish.py)
+    handles the proper-noun mishears, spoken-punctuation, NATO collapse,
+    spelling capture, scratch-that, and email shorthand.
+
+    Spelled-out proper nouns ("Aniket spelled A-N-I-K-E-T") get appended
+    to the same proper_nouns config the LLM path uses, so the keyterms
+    list grows automatically over time.
+
+    Input: numpy int16 PCM array (16kHz mono).
+    Output: final polished text string.
+    """
+    from engine.stt import elevenlabs_rt
+    from engine.polish import regex_polish
+
+    # Empty / silent guard — mirror the heuristics from the Groq path.
+    rms = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
+    if rms < 30:
+        ConfigManager.console_print(f'Audio signal absent (RMS={rms:.0f}), skipping transcription.')
+        return ''
+    sample_rate = ConfigManager.get_config_value('recording_options', 'sample_rate') or 16000
+    duration = len(audio_data) / sample_rate
+    if duration < 0.8 and rms < 200:
+        ConfigManager.console_print(
+            f'Audio too short and quiet ({duration:.2f}s, RMS={rms:.0f}); skipping transcription.'
+        )
+        return ''
+
+    api_key = os.getenv('ELEVENLABS_API_KEY') or ConfigManager.get_config_value('model_options', 'elevenlabs_api_key')
+    if not api_key:
+        ConfigManager.console_print('ElevenLabs API key not set; cannot use ElevenLabs RT engine.')
+        raise TranscriptionAPIError('ElevenLabs API key not set')
+
+    # Build keyterms list from the structured proper_nouns config (mirrors
+    # how the mobile app does it). Max 50 × 20 chars per ElevenLabs limits.
+    keyterms = _build_elevenlabs_keyterms()
+
+    # v0.3 PC initial port: record-then-burst (same as v0.2 mobile). True
+    # streaming-during-recording follows once the burst path is dogfooded.
+    pcm_bytes = _audio_data_to_pcm16_bytes(audio_data)
+    t0 = time.monotonic()
+    result = elevenlabs_rt.transcribe_burst(pcm_bytes, api_key, keyterms)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    if result.get('error'):
+        ConfigManager.console_print(f'ElevenLabs RT failed: {result["error"]}')
+        raise TranscriptionAPIError(f"ElevenLabs RT: {result['error']}")
+
+    raw_text = result.get('text') or ''
+    ConfigManager.console_print(f'ElevenLabs RT in {elapsed_ms}ms: "{raw_text.strip()}"')
+
+    polish_result = regex_polish.apply(raw_text)
+
+    # Auto-add from "spelled" trigger — reuse the existing LLM-path persistence.
+    if polish_result.dict_additions:
+        autoadd_enabled = ConfigManager.get_config_value('llm_polish', 'enable_dict_autoadd_from_spelling')
+        if autoadd_enabled is not False:  # default True
+            try:
+                _persist_dict_additions(polish_result.dict_additions)  # defined above at L633
+            except Exception as e:
+                ConfigManager.console_print(f'dict_add persistence failed: {e}')
+
+    # Schedule the history-delete sweep in the background.
+    try:
+        from engine.retention import history_delete_worker
+        history_delete_worker.schedule_one_shot(api_key)
+    except Exception:
+        pass
+
+    return polish_result.final_text
+
+
+def _audio_data_to_pcm16_bytes(audio_data) -> bytes:
+    """Convert numpy int16 array to raw PCM16 LE bytes."""
+    if audio_data.dtype != np.int16:
+        # sounddevice can produce float32; convert to int16
+        clipped = np.clip(audio_data, -1.0, 1.0)
+        audio_data = (clipped * 32767).astype(np.int16)
+    return audio_data.tobytes()
+
+
+def _build_elevenlabs_keyterms() -> list[str]:
+    """Flatten the structured proper_nouns config into a keyterms list.
+
+    Order: locations, people, products. Filter to ≤20 chars per ElevenLabs's
+    documented limit; cap total at 50.
+    """
+    pn = ConfigManager.get_config_value('llm_polish', 'proper_nouns') or {}
+    terms: list[str] = []
+    for category in ('locations', 'people', 'products'):
+        entries = pn.get(category) or []
+        for e in entries:
+            w = (e.get('word') if isinstance(e, dict) else str(e)).strip()
+            if w and len(w) <= 20:
+                terms.append(w)
+    # Dedup preserving order, cap at 50.
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in terms:
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+        if len(out) >= 50:
+            break
+    return out
+
+
 def transcribe(audio_data, local_model=None):
     if audio_data is None:
         return ''
+
+    # v0.3 routing: check the STT engine pref. If set to elevenlabs, route to
+    # the Realtime + RegexPolish path. Default stays groq so v0.1/v0.2 behaviour
+    # is preserved until the user opts in.
+    stt_engine = ConfigManager.get_config_value('model_options', 'stt_engine') or 'groq'
+    if stt_engine == 'elevenlabs':
+        return _transcribe_via_elevenlabs(audio_data)
 
     # Skip STT only on a completely dead signal (muted mic, no input device).
     # Threshold is intentionally very low — only catches zero/near-zero input, not quiet speech.
@@ -754,4 +906,10 @@ def transcribe(audio_data, local_model=None):
             return ''
         transcription = stripped
 
-    return post_process_transcription(transcription, skip_polish=used_gemini_fallback)
+    result = post_process_transcription(transcription, skip_polish=used_gemini_fallback)
+    try:
+        from dict_diag import dd
+        dd('transcribe.return', result, used_gemini=used_gemini_fallback)
+    except Exception:
+        pass
+    return result
