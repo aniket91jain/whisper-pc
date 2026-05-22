@@ -6,10 +6,12 @@ from datetime import datetime as _datetime
 import numpy as np
 import soundfile as sf
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                              QScrollArea, QPushButton, QFrame, QApplication,
-                              QSizePolicy)
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QCursor
+                              QListView, QPushButton, QApplication,
+                              QStyledItemDelegate, QStyle, QMenu, QDialog,
+                              QPlainTextEdit, QDialogButtonBox)
+from PyQt5.QtCore import (Qt, QTimer, QThread, QSize, QRect, QModelIndex,
+                          QAbstractListModel, pyqtSignal)
+from PyQt5.QtGui import QFont, QCursor, QColor, QPainter, QFontMetrics, QPen
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from ui.base_window import BaseWindow
@@ -18,9 +20,9 @@ from utils import ConfigManager
 
 
 # --- Diagnostic instrumentation (popup_diag.log) ------------------------------
-# Lightweight timing/handle/memory snapshots written next to transcript_log.txt.
-# Goal: localize whether the popup hang is parse, widget creation, or GDI/USER
-# handle pressure on Windows. Remove once root cause is fixed.
+# Lightweight timing/handle/memory snapshots next to transcript_log.txt. Kept
+# through one verification cycle of the Ditto-style rebuild so we can confirm
+# the new architecture is stable; remove once that's done.
 
 _DIAG_PATH = None
 
@@ -41,24 +43,31 @@ def _diag(msg):
         pass
 
 
+# Set ctypes signatures so handle/memory queries don't truncate HANDLE returns
+# on 64-bit Windows. Without these, the diag log just records gdi=0 usr=0.
+try:
+    _ctypes.windll.kernel32.GetCurrentProcess.restype = _ctypes.c_void_p
+    _ctypes.windll.user32.GetGuiResources.argtypes = [_ctypes.c_void_p, _ctypes.c_ulong]
+    _ctypes.windll.user32.GetGuiResources.restype = _ctypes.c_ulong
+    _ctypes.windll.psapi.GetProcessMemoryInfo.argtypes = [
+        _ctypes.c_void_p, _ctypes.c_void_p, _ctypes.c_ulong,
+    ]
+    _ctypes.windll.psapi.GetProcessMemoryInfo.restype = _ctypes.c_int
+except Exception:
+    pass
+
+
 def _handle_counts():
-    """Return (GDI, USER) handle counts for the current process, or (None, None)."""
     try:
-        user32 = _ctypes.windll.user32
-        user32.GetGuiResources.restype = _ctypes.c_uint
-        user32.GetGuiResources.argtypes = [_ctypes.c_void_p, _ctypes.c_uint]
-        kernel32 = _ctypes.windll.kernel32
-        kernel32.GetCurrentProcess.restype = _ctypes.c_void_p
-        hproc = kernel32.GetCurrentProcess()
-        gdi = user32.GetGuiResources(hproc, 0)  # GR_GDIOBJECTS
-        usr = user32.GetGuiResources(hproc, 1)  # GR_USEROBJECTS
+        hproc = _ctypes.windll.kernel32.GetCurrentProcess()
+        gdi = _ctypes.windll.user32.GetGuiResources(hproc, 0)  # GR_GDIOBJECTS
+        usr = _ctypes.windll.user32.GetGuiResources(hproc, 1)  # GR_USEROBJECTS
         return gdi, usr
     except Exception:
         return None, None
 
 
 def _mem_mb():
-    """Return working-set in MB via psapi, or None."""
     try:
         class _PMC(_ctypes.Structure):
             _fields_ = [
@@ -87,39 +96,32 @@ def _fmt_mem(m):
     return f'{m:.1f}MB' if m is not None else 'n/a'
 
 
-# Render only the most-recent N transcripts on first show; "Show older" reveals
-# more in fixed-size chunks. Keeps the popup snappy regardless of log length.
-INITIAL_RENDER_LIMIT = 25
-LOAD_MORE_INCREMENT = 25
+# --- Log parsing --------------------------------------------------------------
 
-
-def _parse_log(log_path):
-    """Read transcript_log.txt; return list of dicts with kind='ok'."""
-    if not os.path.isfile(log_path):
-        return []
-    with open(log_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+def _parse_log_slice(content):
+    """Parse polished-transcript blocks from a text slice. Captures both RAW
+    (pre-polish STT output) and POLISHED so the right-click context menu can
+    expose the unpolished text."""
     entries = []
     for block in content.strip().split('\n\n'):
         lines = block.strip().split('\n')
-        timestamp = polished = ''
+        timestamp = raw = polished = ''
         for line in lines:
             s = line.strip()
             if s.startswith('[') and s.endswith(']'):
                 timestamp = s[1:-1]
+            elif s.startswith('RAW:'):
+                raw = s[4:].strip()
             elif s.startswith('POLISHED:'):
                 polished = s[9:].strip()
         if polished:
-            entries.append({'kind': 'ok', 'timestamp': timestamp, 'text': polished})
+            entries.append({'kind': 'ok', 'timestamp': timestamp,
+                            'text': polished, 'raw': raw})
     return entries
 
 
-def _parse_failed_log(log_path):
-    """Read failed_log.txt; return list of dicts with kind='failed'."""
-    if not os.path.isfile(log_path):
-        return []
-    with open(log_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+def _parse_failed_slice(content):
+    """Parse failed-transcript blocks from a text slice."""
     entries = []
     for block in content.strip().split('\n\n'):
         lines = block.strip().split('\n')
@@ -133,9 +135,22 @@ def _parse_failed_log(log_path):
             elif s.startswith('ERROR:'):
                 error = s[6:].strip()
         if audio_rel:
-            entries.append({'kind': 'failed', 'timestamp': timestamp,
-                            'audio_rel': audio_rel, 'error': error})
+            entries.append({
+                'kind': 'failed',
+                'timestamp': timestamp,
+                'audio_rel': audio_rel,
+                'error': error,
+                'retry_state': 'idle',
+                'retry_error': '',
+            })
     return entries
+
+
+def _read_whole(path):
+    if not path or not os.path.isfile(path):
+        return ''
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
 
 
 def _remove_failed_entry(log_path, audio_rel):
@@ -148,7 +163,6 @@ def _remove_failed_entry(log_path, audio_rel):
     for block in content.strip().split('\n\n'):
         if not block.strip():
             continue
-        # Skip blocks pointing at the audio we just succeeded on
         if any(line.strip() == f'AUDIO:    {audio_rel}' or
                line.strip() == f'AUDIO: {audio_rel}'
                for line in block.split('\n')):
@@ -172,166 +186,9 @@ def _simulate_paste():
         pass
 
 
-class TranscriptCard(QFrame):
-    def __init__(self, timestamp, polished, parent=None):
-        super().__init__(parent)
-        self._polished = polished
-        self.setObjectName('TranscriptCard')
-        self.setCursor(QCursor(Qt.PointingHandCursor))
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        self._set_style(hovered=False)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(3)
-
-        ts_label = QLabel(timestamp)
-        ts_label.setFont(QFont('Segoe UI', 8))
-        ts_label.setStyleSheet('color: #999; background: transparent;')
-        layout.addWidget(ts_label)
-
-        self._text_label = QLabel(polished)
-        self._text_label.setFont(QFont('Segoe UI', 10))
-        self._text_label.setWordWrap(True)
-        self._text_label.setStyleSheet('color: #2c2c2c; background: transparent;')
-        layout.addWidget(self._text_label)
-
-        self._status_label = QLabel()
-        self._status_label.setFont(QFont('Segoe UI', 8))
-        self._status_label.setStyleSheet('color: #3a863a; background: transparent;')
-        self._status_label.hide()
-        layout.addWidget(self._status_label)
-
-    def _set_style(self, hovered):
-        bg, border = ('#eaf4ea', '#5aac5a') if hovered else ('#f7f7f7', '#e0e0e0')
-        self.setStyleSheet(f'''
-            QFrame#TranscriptCard {{
-                background-color: {bg};
-                border: 1px solid {border};
-                border-radius: 8px;
-            }}
-        ''')
-
-    def enterEvent(self, event):
-        self._set_style(hovered=True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._set_style(hovered=False)
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            QApplication.clipboard().setText(self._polished)
-            # Paste into whichever app still has focus (50ms lets clipboard settle)
-            QTimer.singleShot(50, _simulate_paste)
-            self._status_label.setText('✓  Pasted at cursor')
-            self._status_label.show()
-            QTimer.singleShot(2000, self._status_label.hide)
-        event.accept()  # don't bubble up to BaseWindow drag handler
-
-
-class FailedTranscriptCard(QFrame):
-    """Red-tinted card for an API-failed recording. Includes a Retry button."""
-
-    retryRequested = pyqtSignal(str, object)  # audio_abs_path, self
-
-    def __init__(self, timestamp, audio_abs_path, audio_rel, error_text, parent=None):
-        super().__init__(parent)
-        self.audio_abs_path = audio_abs_path
-        self.audio_rel = audio_rel
-        self.setObjectName('FailedTranscriptCard')
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        self._set_style(hovered=False)
-
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(12, 8, 12, 8)
-        outer.setSpacing(8)
-
-        text_col = QVBoxLayout()
-        text_col.setSpacing(3)
-
-        ts_label = QLabel(timestamp)
-        ts_label.setFont(QFont('Segoe UI', 8))
-        ts_label.setStyleSheet('color: #999; background: transparent;')
-        text_col.addWidget(ts_label)
-
-        body_text = '⚠  ' + (error_text or 'Transcription failed')
-        if not os.path.isfile(audio_abs_path):
-            body_text += '  (audio missing)'
-        self._body = QLabel(body_text)
-        self._body.setFont(QFont('Segoe UI', 10))
-        self._body.setWordWrap(True)
-        self._body.setStyleSheet('color: #8a2828; background: transparent;')
-        text_col.addWidget(self._body)
-
-        self._sub = QLabel('')
-        self._sub.setFont(QFont('Segoe UI', 8))
-        self._sub.setStyleSheet('color: #b04040; background: transparent;')
-        self._sub.hide()
-        text_col.addWidget(self._sub)
-
-        outer.addLayout(text_col, stretch=1)
-
-        self._retry_btn = QPushButton('↻  Retry')
-        self._retry_btn.setFont(QFont('Segoe UI', 9))
-        self._retry_btn.setFixedHeight(28)
-        self._retry_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._retry_btn.setStyleSheet('''
-            QPushButton {
-                background: #fff;
-                border: 1px solid #d77;
-                border-radius: 4px;
-                padding: 0 12px;
-                color: #8a2828;
-            }
-            QPushButton:hover { background: #ffeaea; }
-            QPushButton:disabled { background: #f5f5f5; color: #999; border-color: #ccc; }
-        ''')
-        self._retry_btn.setEnabled(os.path.isfile(audio_abs_path))
-        self._retry_btn.clicked.connect(self._on_retry_clicked)
-        outer.addWidget(self._retry_btn, alignment=Qt.AlignVCenter)
-
-    def _set_style(self, hovered):
-        bg, border = ('#fbd9d9', '#d77') if hovered else ('#fdecec', '#e8b8b8')
-        self.setStyleSheet(f'''
-            QFrame#FailedTranscriptCard {{
-                background-color: {bg};
-                border: 1px solid {border};
-                border-radius: 8px;
-            }}
-        ''')
-
-    def enterEvent(self, event):
-        self._set_style(hovered=True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._set_style(hovered=False)
-        super().leaveEvent(event)
-
-    def _on_retry_clicked(self):
-        self.set_retrying(True)
-        self.retryRequested.emit(self.audio_abs_path, self)
-
-    def set_retrying(self, retrying):
-        if retrying:
-            self._retry_btn.setEnabled(False)
-            self._retry_btn.setText('…  Retrying')
-            self._sub.hide()
-        else:
-            self._retry_btn.setEnabled(True)
-            self._retry_btn.setText('↻  Retry')
-
-    def show_retry_error(self, reason):
-        self.set_retrying(False)
-        self._sub.setText(f'Retry failed: {reason}')
-        self._sub.show()
-
+# --- Retry worker -------------------------------------------------------------
 
 class RetryWorker(QThread):
-    """Re-runs transcription on a saved WAV file in a background thread."""
-
     successSignal = pyqtSignal(str, str)  # audio_abs_path, polished_text
     errorSignal = pyqtSignal(str, str)    # audio_abs_path, reason
 
@@ -354,61 +211,460 @@ class RetryWorker(QThread):
             self.errorSignal.emit(self.audio_abs_path, f'{type(e).__name__}: {e}')
 
 
+# --- Model + roles ------------------------------------------------------------
+
+KindRole = Qt.UserRole + 1        # 'ok' or 'failed'
+TimestampRole = Qt.UserRole + 2
+TextRole = Qt.UserRole + 3        # polished text (ok only)
+AudioRelRole = Qt.UserRole + 4    # failed only
+AudioAbsRole = Qt.UserRole + 5    # failed only
+ErrorRole = Qt.UserRole + 6       # failed only
+RetryStateRole = Qt.UserRole + 7  # 'idle' / 'retrying'
+RetryErrorRole = Qt.UserRole + 8  # last retry-failure reason
+RawRole = Qt.UserRole + 9         # pre-polish STT output (ok only)
+
+
+class TranscriptHistoryModel(QAbstractListModel):
+    """Newest-first list of transcripts. Tail-reads on refresh()."""
+
+    def __init__(self, log_path, failed_log_path, project_root, parent=None):
+        super().__init__(parent)
+        self._log_path = log_path
+        self._failed_log_path = failed_log_path
+        self._project_root = project_root
+        self._entries = []
+        self._ok_last_size = 0
+        self._failed_last_size = 0
+        self._reload()
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._entries)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        i = index.row()
+        if i < 0 or i >= len(self._entries):
+            return None
+        e = self._entries[i]
+        if role == KindRole:
+            return e['kind']
+        if role == TimestampRole:
+            return e.get('timestamp', '')
+        if role == TextRole:
+            return e.get('text', '')
+        if role == AudioRelRole:
+            return e.get('audio_rel', '')
+        if role == AudioAbsRole:
+            audio_rel = e.get('audio_rel')
+            if audio_rel:
+                return os.path.join(self._project_root, audio_rel.replace('/', os.sep))
+            return ''
+        if role == ErrorRole:
+            return e.get('error', '')
+        if role == RetryStateRole:
+            return e.get('retry_state', 'idle')
+        if role == RetryErrorRole:
+            return e.get('retry_error', '')
+        if role == RawRole:
+            return e.get('raw', '')
+        if role == Qt.DisplayRole:
+            return e.get('text') or e.get('error') or ''
+        return None
+
+    def _reload(self):
+        ok_content = _read_whole(self._log_path)
+        failed_content = _read_whole(self._failed_log_path)
+        merged = _parse_log_slice(ok_content) + _parse_failed_slice(failed_content)
+        merged.sort(key=lambda e: e.get('timestamp', ''), reverse=True)
+
+        self.beginResetModel()
+        self._entries = merged
+        self._ok_last_size = os.path.getsize(self._log_path) if os.path.isfile(self._log_path) else 0
+        self._failed_last_size = (os.path.getsize(self._failed_log_path)
+                                  if self._failed_log_path and os.path.isfile(self._failed_log_path)
+                                  else 0)
+        self.endResetModel()
+
+    def refresh(self):
+        """Tail-read new entries from both logs. Falls back to full reload if
+        either file shrank (truncation, rotation, retry-success cleanup)."""
+        cur_ok_size = os.path.getsize(self._log_path) if os.path.isfile(self._log_path) else 0
+        cur_fail_size = (os.path.getsize(self._failed_log_path)
+                         if self._failed_log_path and os.path.isfile(self._failed_log_path)
+                         else 0)
+
+        if cur_ok_size < self._ok_last_size or cur_fail_size < self._failed_last_size:
+            self._reload()
+            return
+
+        new_entries = []
+        if cur_ok_size > self._ok_last_size:
+            with open(self._log_path, 'r', encoding='utf-8') as f:
+                f.seek(self._ok_last_size)
+                tail = f.read()
+            new_entries.extend(_parse_log_slice(tail))
+            self._ok_last_size = cur_ok_size
+        if self._failed_log_path and cur_fail_size > self._failed_last_size:
+            with open(self._failed_log_path, 'r', encoding='utf-8') as f:
+                f.seek(self._failed_last_size)
+                tail = f.read()
+            new_entries.extend(_parse_failed_slice(tail))
+            self._failed_last_size = cur_fail_size
+
+        if not new_entries:
+            return
+
+        new_entries.sort(key=lambda e: e.get('timestamp', ''), reverse=True)
+        self.beginInsertRows(QModelIndex(), 0, len(new_entries) - 1)
+        self._entries = new_entries + self._entries
+        self.endInsertRows()
+
+    def set_retry_state(self, row, state, error_text=''):
+        if 0 <= row < len(self._entries):
+            self._entries[row]['retry_state'] = state
+            self._entries[row]['retry_error'] = error_text
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx)
+
+    def find_failed_row_by_audio_rel(self, audio_rel):
+        for i, e in enumerate(self._entries):
+            if e['kind'] == 'failed' and e.get('audio_rel') == audio_rel:
+                return i
+        return -1
+
+
+# --- Delegate -----------------------------------------------------------------
+
+class TranscriptItemDelegate(QStyledItemDelegate):
+    """Paints one row: timestamp + body inside a rounded card.
+    Failed rows include a 'Retry' pill on the right side; the list view turns
+    a click in that rect into a retryClicked signal."""
+
+    MARGIN_H = 12
+    MARGIN_V = 8
+    INNER_SPACING = 3
+    INTER_CARD_GAP = 6
+    BTN_W = 78
+    BTN_H = 26
+    BTN_INSET_R = 10
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ts_font = QFont('Segoe UI', 8)
+        self._body_font = QFont('Segoe UI', 10)
+        self._btn_font = QFont('Segoe UI', 9)
+        self._ts_fm = QFontMetrics(self._ts_font)
+        self._body_fm = QFontMetrics(self._body_font)
+
+    @classmethod
+    def card_rect(cls, option_rect):
+        return QRect(
+            option_rect.left(),
+            option_rect.top(),
+            option_rect.width(),
+            option_rect.height() - cls.INTER_CARD_GAP,
+        )
+
+    @classmethod
+    def retry_rect(cls, card_rect):
+        return QRect(
+            card_rect.right() - cls.BTN_INSET_R - cls.BTN_W,
+            card_rect.top() + (card_rect.height() - cls.BTN_H) // 2,
+            cls.BTN_W,
+            cls.BTN_H,
+        )
+
+    def paint(self, painter, option, index):
+        kind = index.data(KindRole) or 'ok'
+        timestamp = index.data(TimestampRole) or ''
+        hovered = bool(option.state & QStyle.State_MouseOver)
+
+        if kind == 'ok':
+            body_text = index.data(TextRole) or ''
+            if hovered:
+                bg, border, body_color = QColor('#eaf4ea'), QColor('#5aac5a'), QColor('#2c2c2c')
+            else:
+                bg, border, body_color = QColor('#f7f7f7'), QColor('#e0e0e0'), QColor('#2c2c2c')
+        else:
+            err = index.data(ErrorRole) or 'Transcription failed'
+            retry_err = index.data(RetryErrorRole) or ''
+            body_text = '⚠  ' + err
+            if retry_err:
+                body_text += f'\nRetry failed: {retry_err}'
+            if hovered:
+                bg, border, body_color = QColor('#fbd9d9'), QColor('#d77'), QColor('#8a2828')
+            else:
+                bg, border, body_color = QColor('#fdecec'), QColor('#e8b8b8'), QColor('#8a2828')
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        card = self.card_rect(option.rect)
+        painter.setBrush(bg)
+        painter.setPen(QPen(border, 1))
+        painter.drawRoundedRect(card, 8, 8)
+
+        right_reserve = (self.BTN_W + self.BTN_INSET_R + 4) if kind == 'failed' else 0
+        text_left = card.left() + self.MARGIN_H
+        text_right = card.right() - self.MARGIN_H - right_reserve
+        text_width = max(text_right - text_left, 10)
+
+        painter.setFont(self._ts_font)
+        painter.setPen(QColor('#999'))
+        ts_y = card.top() + self.MARGIN_V + self._ts_fm.ascent()
+        painter.drawText(text_left, ts_y, timestamp)
+
+        painter.setFont(self._body_font)
+        painter.setPen(body_color)
+        body_top = card.top() + self.MARGIN_V + self._ts_fm.height() + self.INNER_SPACING
+        body_rect = QRect(text_left, body_top, text_width,
+                          card.bottom() - body_top - self.MARGIN_V)
+        painter.drawText(body_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, body_text)
+
+        if kind == 'failed':
+            state = index.data(RetryStateRole) or 'idle'
+            audio_abs = index.data(AudioAbsRole) or ''
+            audio_present = bool(audio_abs) and os.path.isfile(audio_abs)
+            btn = self.retry_rect(card)
+            if state == 'retrying':
+                btn_bg, btn_border, btn_fg, btn_label = (
+                    QColor('#f5f5f5'), QColor('#ccc'), QColor('#999'), '…  Retrying'
+                )
+            elif not audio_present:
+                btn_bg, btn_border, btn_fg, btn_label = (
+                    QColor('#f5f5f5'), QColor('#ccc'), QColor('#999'), '↻ Retry'
+                )
+            else:
+                btn_bg, btn_border, btn_fg, btn_label = (
+                    QColor('#ffffff'), QColor('#d77'), QColor('#8a2828'), '↻ Retry'
+                )
+            painter.setBrush(btn_bg)
+            painter.setPen(QPen(btn_border, 1))
+            painter.drawRoundedRect(btn, 4, 4)
+            painter.setFont(self._btn_font)
+            painter.setPen(btn_fg)
+            painter.drawText(btn, Qt.AlignCenter, btn_label)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        kind = index.data(KindRole) or 'ok'
+        if kind == 'ok':
+            body_text = index.data(TextRole) or ''
+        else:
+            body_text = '⚠  ' + (index.data(ErrorRole) or 'Transcription failed')
+            retry_err = index.data(RetryErrorRole) or ''
+            if retry_err:
+                body_text += f'\nRetry failed: {retry_err}'
+
+        width = option.rect.width()
+        if width <= 0:
+            view = self.parent()
+            if isinstance(view, QListView):
+                width = view.viewport().width()
+            if width <= 0:
+                width = 520
+
+        right_reserve = (self.BTN_W + self.BTN_INSET_R + 4) if kind == 'failed' else 0
+        text_width = max(width - (2 * self.MARGIN_H) - right_reserve, 10)
+        body_rect = self._body_fm.boundingRect(
+            0, 0, text_width, 100000,
+            Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop,
+            body_text,
+        )
+        height = (self.MARGIN_V + self._ts_fm.height() + self.INNER_SPACING +
+                  body_rect.height() + self.MARGIN_V + self.INTER_CARD_GAP)
+        if kind == 'failed':
+            min_h = self.BTN_H + 2 * self.MARGIN_V + self.INTER_CARD_GAP
+            height = max(height, min_h)
+        return QSize(width, max(height, 48))
+
+
+# --- List view (custom click handling) ----------------------------------------
+
+class _RawPolishedDialog(QDialog):
+    """Modal showing both RAW (pre-polish STT output) and POLISHED side by side.
+    Selectable, copyable text so the user can grab either for re-use."""
+
+    def __init__(self, timestamp, raw, polished, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f'Transcript — {timestamp}')
+        self.resize(700, 420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        raw_label = QLabel('RAW (pre-polish STT output):')
+        raw_label.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        layout.addWidget(raw_label)
+        raw_edit = QPlainTextEdit(raw or '(empty — pre-polish text not recorded for this entry)')
+        raw_edit.setReadOnly(True)
+        raw_edit.setFont(QFont('Segoe UI', 10))
+        layout.addWidget(raw_edit, stretch=1)
+
+        polished_label = QLabel('POLISHED (what got typed):')
+        polished_label.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        layout.addWidget(polished_label)
+        polished_edit = QPlainTextEdit(polished or '')
+        polished_edit.setReadOnly(True)
+        polished_edit.setFont(QFont('Segoe UI', 10))
+        layout.addWidget(polished_edit, stretch=1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        layout.addWidget(btns)
+
+
+class TranscriptListView(QListView):
+    """Click on an OK row → okClicked(text). Click on a failed-row retry pill
+    → retryClicked(row). Right-click → context menu (copy RAW, view RAW vs
+    POLISHED, etc.). Selection is disabled to keep the visual quiet."""
+
+    okClicked = pyqtSignal(str)
+    retryClicked = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QListView.NoSelection)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollMode(QListView.ScrollPerPixel)
+        self.setUniformItemSizes(False)
+        self.setFocusPolicy(Qt.NoFocus)
+        # MouseTracking on the viewport drives QStyle::State_MouseOver for hover.
+        self.viewport().setMouseTracking(True)
+        self.setMouseTracking(True)
+        self.setStyleSheet(
+            'QListView { background: transparent; border: none; }'
+            'QListView::item { background: transparent; }'
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        idx = self.indexAt(event.pos())
+        if not idx.isValid():
+            super().mousePressEvent(event)
+            return
+
+        rect = self.visualRect(idx)
+        kind = idx.data(KindRole)
+        if kind == 'ok':
+            self.okClicked.emit(idx.data(TextRole) or '')
+            event.accept()
+            return
+        if kind == 'failed':
+            card = TranscriptItemDelegate.card_rect(rect)
+            btn = TranscriptItemDelegate.retry_rect(card)
+            if btn.contains(event.pos()):
+                self.retryClicked.emit(idx.row())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Word-wrap heights depend on viewport width; force re-layout.
+        self.scheduleDelayedItemsLayout()
+
+    def contextMenuEvent(self, event):
+        idx = self.indexAt(event.pos())
+        if not idx.isValid():
+            return
+        kind = idx.data(KindRole)
+        menu = QMenu(self)
+
+        if kind == 'ok':
+            polished = idx.data(TextRole) or ''
+            raw = idx.data(RawRole) or ''
+            ts = idx.data(TimestampRole) or ''
+
+            act_copy_polished = menu.addAction('Copy polished text')
+            act_copy_raw = menu.addAction('Copy raw (pre-polish) transcript')
+            act_view = menu.addAction('View RAW + POLISHED…')
+            # Disable raw-side actions when there's no raw recorded (older
+            # entries that pre-date dual-line logging, or any future entry
+            # logged without a RAW line).
+            if not raw:
+                act_copy_raw.setEnabled(False)
+                act_copy_raw.setText('Copy raw  (not recorded)')
+
+            chosen = menu.exec_(event.globalPos())
+            if chosen is act_copy_polished:
+                QApplication.clipboard().setText(polished)
+            elif chosen is act_copy_raw:
+                QApplication.clipboard().setText(raw)
+            elif chosen is act_view:
+                dlg = _RawPolishedDialog(ts, raw, polished, parent=self.window())
+                dlg.exec_()
+            return
+
+        if kind == 'failed':
+            err = idx.data(ErrorRole) or ''
+            audio_rel = idx.data(AudioRelRole) or ''
+            audio_abs = idx.data(AudioAbsRole) or ''
+            act_copy_err = menu.addAction('Copy error message')
+            act_copy_path = menu.addAction('Copy audio file path')
+            if not audio_rel:
+                act_copy_path.setEnabled(False)
+
+            chosen = menu.exec_(event.globalPos())
+            if chosen is act_copy_err:
+                QApplication.clipboard().setText(err)
+            elif chosen is act_copy_path:
+                QApplication.clipboard().setText(audio_abs or audio_rel)
+
+
+# --- The window ---------------------------------------------------------------
+
 class TranscriptHistoryWindow(BaseWindow):
+    """Persistent singleton — constructed once at app startup, hidden when not
+    in use, shown on hotkey/tray. Virtualized QListView keeps every operation
+    cheap regardless of log size."""
+
     def __init__(self, log_path, failed_log_path=None, local_model=None, input_simulator=None):
         super().__init__('Transcript History', 540, 680)
         self._log_path = log_path
         self._failed_log_path = failed_log_path
-        # Project root = directory containing transcript_log.txt; failed/<wav>
-        # lives under there too (set in result_thread._persist_failed_recording).
         self._project_root = os.path.dirname(os.path.abspath(log_path))
         self._local_model = local_model
         self._input_simulator = input_simulator
-        self._retry_workers = []  # keep QThread refs alive while running
+        self._retry_workers = []
 
-        # Float above all other windows; Tool keeps it off the taskbar.
-        # WA_ShowWithoutActivating prevents stealing focus when show() is called.
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
         _diag_init(log_path)
         gdi0, usr0 = _handle_counts()
+        log_size = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
         _diag(f'__init__ start gdi={gdi0} usr={usr0} mem={_fmt_mem(_mem_mb())} '
-              f'log_size={os.path.getsize(log_path) if os.path.isfile(log_path) else 0}B')
+              f'log_size={log_size}B')
         t0 = time.perf_counter()
-        self._init_content()
-        t_init = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        self._load()
-        t_load = time.perf_counter() - t0
-        _diag(f'__init__ done init_content={t_init:.3f}s load={t_load:.3f}s')
 
-    def showEvent(self, event):
-        t0 = time.perf_counter()
-        gdi0, usr0 = _handle_counts()
-        super().showEvent(event)
-        # WS_EX_NOACTIVATE: window receives mouse events but never becomes the
-        # active (keyboard-focus) window when clicked — so clicks paste into the
-        # previously focused app via _simulate_paste().
-        try:
-            import ctypes
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            hwnd = int(self.winId())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
-        except Exception:
-            pass  # Non-Windows or ctypes unavailable; window still stays on top
+        self._init_content()
+        self._model = TranscriptHistoryModel(
+            log_path, failed_log_path, self._project_root, parent=self,
+        )
+        self._list_view.setModel(self._model)
+        self._list_view.okClicked.connect(self._on_ok_clicked)
+        self._list_view.retryClicked.connect(self._on_retry_clicked)
+
         gdi1, usr1 = _handle_counts()
-        _diag(f'showEvent: {time.perf_counter()-t0:.3f}s '
-              f'gdi={gdi0}->{gdi1} usr={usr0}->{usr1} mem={_fmt_mem(_mem_mb())}')
+        _diag(f'__init__ done in {time.perf_counter()-t0:.3f}s '
+              f'rows={self._model.rowCount()} gdi={gdi0}->{gdi1} usr={usr0}->{usr1} '
+              f'mem={_fmt_mem(_mem_mb())}')
 
     def _init_content(self):
         header_row = QHBoxLayout()
-        self._hint_label = QLabel('Click any entry to paste at cursor')
-        self._hint_label.setFont(QFont('Segoe UI', 9))
-        self._hint_label.setStyleSheet('color: #666;')
-        header_row.addWidget(self._hint_label)
+        hint = QLabel('Click any entry to paste at cursor')
+        hint.setFont(QFont('Segoe UI', 9))
+        hint.setStyleSheet('color: #666;')
+        header_row.addWidget(hint)
         header_row.addStretch()
 
         refresh_btn = QPushButton('↻  Refresh')
@@ -425,179 +681,98 @@ class TranscriptHistoryWindow(BaseWindow):
             }
             QPushButton:hover { background: #e0e0e0; }
         ''')
-        refresh_btn.clicked.connect(self._load)
+        refresh_btn.clicked.connect(self.refresh)
         header_row.addWidget(refresh_btn)
         self.main_layout.addLayout(header_row)
 
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet('QScrollArea { border: none; background: transparent; }')
+        self._list_view = TranscriptListView(self)
+        self._list_view.setItemDelegate(TranscriptItemDelegate(self._list_view))
+        self.main_layout.addWidget(self._list_view, stretch=1)
 
-        self._container = QWidget()
-        self._container.setStyleSheet('background: transparent;')
-        self._cards_layout = QVBoxLayout(self._container)
-        self._cards_layout.setContentsMargins(0, 0, 6, 0)
-        self._cards_layout.setSpacing(8)
-        self._cards_layout.addStretch()
+        self._status_label = QLabel('')
+        self._status_label.setFont(QFont('Segoe UI', 9))
+        self._status_label.setStyleSheet('color: #3a863a;')
+        self._status_label.setAlignment(Qt.AlignCenter)
+        self._status_label.hide()
+        self.main_layout.addWidget(self._status_label)
 
-        self._scroll.setWidget(self._container)
-        self.main_layout.addWidget(self._scroll)
-
-        # All parsed entries (newest first); only a prefix is materialized as cards.
-        self._all_entries = []
-        self._rendered_count = 0
-        self._show_more_btn = None
-
-    def _load(self):
-        """Re-parse logs from disk and render the most-recent INITIAL_RENDER_LIMIT
-        entries. Older entries stay in self._all_entries until the user clicks
-        'Show older'."""
-        t_total_start = time.perf_counter()
+    def showEvent(self, event):
+        t0 = time.perf_counter()
         gdi0, usr0 = _handle_counts()
-        mem0 = _mem_mb()
-
-        cleared = self._clear_cards()
-        t_clear = time.perf_counter() - t_total_start
-
-        t = time.perf_counter()
-        ok_entries = _parse_log(self._log_path)
-        t_parse_ok = time.perf_counter() - t
-
-        t = time.perf_counter()
-        failed_entries = _parse_failed_log(self._failed_log_path) if self._failed_log_path else []
-        t_parse_failed = time.perf_counter() - t
-
-        entries = ok_entries + failed_entries
-        # Newest first by timestamp string (ISO-like format sorts correctly)
-        entries.sort(key=lambda e: e.get('timestamp', ''), reverse=True)
-        self._all_entries = entries
-        self._rendered_count = 0
-
-        if not entries:
-            label = QLabel('No transcriptions yet.\nDictate something and come back.')
-            label.setFont(QFont('Segoe UI', 10))
-            label.setStyleSheet('color: #aaa;')
-            label.setAlignment(Qt.AlignCenter)
-            self._cards_layout.insertWidget(0, label)
-            _diag(f'_load: empty total={time.perf_counter()-t_total_start:.3f}s '
-                  f'cleared={cleared}')
-            return
-
-        t = time.perf_counter()
-        rendered = self._render_more(INITIAL_RENDER_LIMIT)
-        t_cards = time.perf_counter() - t
-
+        super().showEvent(event)
+        # WS_EX_NOACTIVATE: window receives mouse events but never becomes the
+        # active (keyboard-focus) window, so clicks paste into the previously
+        # focused app via _simulate_paste().
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            hwnd = int(self.winId())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+        except Exception:
+            pass
         gdi1, usr1 = _handle_counts()
-        mem1 = _mem_mb()
-        _diag(
-            f'_load: total={time.perf_counter()-t_total_start:.3f}s '
-            f'cleared={cleared} clear={t_clear:.3f}s '
-            f'parse_ok={t_parse_ok:.3f}s({len(ok_entries)}) '
-            f'parse_failed={t_parse_failed:.3f}s({len(failed_entries)}) '
-            f'rendered={rendered}/{len(entries)} cards={t_cards:.3f}s '
-            f'gdi={gdi0}->{gdi1} usr={usr0}->{usr1} '
-            f'mem={_fmt_mem(mem0)}->{_fmt_mem(mem1)}'
-        )
+        _diag(f'showEvent: {time.perf_counter()-t0:.3f}s '
+              f'gdi={gdi0}->{gdi1} usr={usr0}->{usr1} mem={_fmt_mem(_mem_mb())}')
 
-    def _clear_cards(self):
-        """Remove all card widgets and any 'Show older' footer; keep the trailing
-        stretch. Returns the number of widgets cleared."""
-        cleared = 0
-        # Iterate from the front; the trailing stretch (a QSpacerItem, no widget)
-        # is naturally skipped because takeAt advances the live index.
-        i = 0
-        while i < self._cards_layout.count():
-            item = self._cards_layout.itemAt(i)
-            if item is None:
-                break
-            if item.widget() is not None:
-                taken = self._cards_layout.takeAt(i)
-                taken.widget().deleteLater()
-                cleared += 1
-            else:
-                i += 1
-        self._show_more_btn = None
-        return cleared
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
 
-    def _render_more(self, n):
-        """Materialize the next `n` entries from self._all_entries as cards,
-        starting at self._rendered_count. Returns how many cards were actually
-        added. Updates the 'Show older' footer."""
-        if self._show_more_btn is not None:
-            # Drop the existing footer; we'll re-add (or skip) below.
-            idx = self._cards_layout.indexOf(self._show_more_btn)
-            if idx >= 0:
-                self._cards_layout.takeAt(idx)
-            self._show_more_btn.deleteLater()
-            self._show_more_btn = None
+    def refresh(self):
+        t0 = time.perf_counter()
+        before = self._model.rowCount()
+        self._model.refresh()
+        after = self._model.rowCount()
+        _diag(f'refresh: {time.perf_counter()-t0:.3f}s rows={before}->{after}')
 
-        start = self._rendered_count
-        end = min(start + n, len(self._all_entries))
-        # Cards live before the trailing stretch; insert at len-1 (stretch index).
-        for i in range(start, end):
-            entry = self._all_entries[i]
-            if entry['kind'] == 'ok':
-                card = TranscriptCard(entry['timestamp'], entry['text'], self._container)
-            else:
-                audio_abs = os.path.join(
-                    self._project_root, entry['audio_rel'].replace('/', os.sep)
-                )
-                card = FailedTranscriptCard(
-                    entry['timestamp'], audio_abs, entry['audio_rel'],
-                    entry['error'], self._container,
-                )
-                card.retryRequested.connect(self._on_retry_requested)
-            insert_at = self._cards_layout.count() - 1  # before the stretch
-            self._cards_layout.insertWidget(insert_at, card)
-        added = end - start
-        self._rendered_count = end
-
-        remaining = len(self._all_entries) - self._rendered_count
-        if remaining > 0:
-            self._show_more_btn = QPushButton(
-                f'Show {min(LOAD_MORE_INCREMENT, remaining)} older  '
-                f'({self._rendered_count} of {len(self._all_entries)} shown)'
-            )
-            self._show_more_btn.setFont(QFont('Segoe UI', 9))
-            self._show_more_btn.setFixedHeight(32)
-            self._show_more_btn.setCursor(QCursor(Qt.PointingHandCursor))
-            self._show_more_btn.setStyleSheet('''
-                QPushButton {
-                    background: #f0f0f0;
-                    border: 1px solid #ccc;
-                    border-radius: 4px;
-                    padding: 0 12px;
-                    color: #404040;
-                }
-                QPushButton:hover { background: #e0e0e0; }
-            ''')
-            self._show_more_btn.clicked.connect(self._on_show_more_clicked)
-            insert_at = self._cards_layout.count() - 1
-            self._cards_layout.insertWidget(insert_at, self._show_more_btn)
-        return added
-
-    def _on_show_more_clicked(self):
-        t = time.perf_counter()
-        added = self._render_more(LOAD_MORE_INCREMENT)
-        _diag(f'_show_more: added={added} now_rendered={self._rendered_count}/'
-              f'{len(self._all_entries)} t={time.perf_counter()-t:.3f}s')
-
-    def _on_retry_requested(self, audio_abs_path, card):
-        if self._local_model is None and not ConfigManager.get_config_value('model_options', 'use_api'):
-            card.show_retry_error('Local model not loaded')
+    def _on_ok_clicked(self, polished_text):
+        if not polished_text:
             return
-        worker = RetryWorker(audio_abs_path, self._local_model)
-        worker.successSignal.connect(lambda path, text, c=card: self._on_retry_success(path, text, c))
-        worker.errorSignal.connect(lambda path, reason, c=card: self._on_retry_error(path, reason, c))
-        worker.finished.connect(lambda w=worker: self._retry_workers.remove(w) if w in self._retry_workers else None)
+        QApplication.clipboard().setText(polished_text)
+        # 50ms lets the clipboard settle before Ctrl+V fires.
+        QTimer.singleShot(50, _simulate_paste)
+        self._status_label.setText('✓  Pasted at cursor')
+        self._status_label.show()
+        QTimer.singleShot(2000, self._status_label.hide)
+
+    def _on_retry_clicked(self, row):
+        m = self._model
+        if row < 0 or row >= m.rowCount():
+            return
+        idx = m.index(row)
+        if idx.data(KindRole) != 'failed':
+            return
+        if idx.data(RetryStateRole) == 'retrying':
+            return
+
+        audio_abs = idx.data(AudioAbsRole) or ''
+        audio_rel = idx.data(AudioRelRole) or ''
+        if not audio_abs or not os.path.isfile(audio_abs):
+            m.set_retry_state(row, 'idle', 'audio missing')
+            return
+        if self._local_model is None and not ConfigManager.get_config_value('model_options', 'use_api'):
+            m.set_retry_state(row, 'idle', 'local model not loaded')
+            return
+
+        m.set_retry_state(row, 'retrying', '')
+
+        worker = RetryWorker(audio_abs, self._local_model)
+        worker.successSignal.connect(
+            lambda p, t, ar=audio_rel: self._on_retry_success(p, t, ar)
+        )
+        worker.errorSignal.connect(
+            lambda p, r, ar=audio_rel: self._on_retry_error(p, r, ar)
+        )
+        worker.finished.connect(
+            lambda w=worker: self._retry_workers.remove(w) if w in self._retry_workers else None
+        )
         self._retry_workers.append(worker)
         worker.start()
 
-    def _on_retry_success(self, audio_abs_path, text, card):
-        # On a successful retry, transcript_log.txt has already been appended to
-        # by llm_polish() inside transcribe(). Type the text into the focused app
-        # (matching first-pass behavior), then clean up the failed entry + WAV.
+    def _on_retry_success(self, audio_abs, text, audio_rel):
+        # llm_polish() inside transcribe() already appended to transcript_log.
         if text and self._input_simulator is not None:
             try:
                 self._input_simulator.typewrite(text)
@@ -605,19 +780,19 @@ class TranscriptHistoryWindow(BaseWindow):
                 ConfigManager.console_print(f'typewrite failed during retry: {e}')
 
         try:
-            if os.path.isfile(audio_abs_path):
-                os.remove(audio_abs_path)
+            if os.path.isfile(audio_abs):
+                os.remove(audio_abs)
         except Exception as e:
-            ConfigManager.console_print(f'Could not delete failed audio {audio_abs_path}: {e}')
+            ConfigManager.console_print(f'Could not delete failed audio {audio_abs}: {e}')
 
         if self._failed_log_path:
-            _remove_failed_entry(self._failed_log_path, card.audio_rel)
+            _remove_failed_entry(self._failed_log_path, audio_rel)
 
-        self._load()
+        # Failed-log shrank → refresh() detects it and triggers a full reload,
+        # surfacing the new ok entry too.
+        self.refresh()
 
-    def _on_retry_error(self, audio_abs_path, reason, card):
-        card.show_retry_error(reason)
-
-    def closeEvent(self, event):
-        self.hide()
-        event.ignore()
+    def _on_retry_error(self, audio_abs, reason, audio_rel):
+        row = self._model.find_failed_row_by_audio_rel(audio_rel)
+        if row >= 0:
+            self._model.set_retry_state(row, 'idle', reason)

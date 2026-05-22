@@ -52,13 +52,20 @@ class InputSimulator:
         'RICHEDIT50W',                   # Word and newer rich text controls
         'Scintilla',                     # Code editors (Notepad++, etc.)
         'Chrome_RenderWidgetHostHWND',   # Chrome / Edge / Electron (child control)
-        'Chrome_WidgetWin_1',            # Chrome / Edge / Electron (top-level) ← main fix
+        'Chrome_WidgetWin_1',            # Chrome / Edge / Electron (top-level)
         'MozillaWindowClass',            # Firefox
         'Notepad',                       # Windows Notepad
         'ConsoleWindowClass',            # Windows Terminal / cmd
         '_WwG',                          # Word document body
         'EXCEL7',                        # Excel cell-edit pane
         'paneClassDC',                   # PowerPoint slide pane
+        # WinUI 3 / Windows 11 modern input host — Loop, new Outlook, Teams
+        # (new client), Notepad 11, Settings textboxes, modern File Explorer
+        # search boxes, and a growing share of Windows 11 native UIs. Diag
+        # log (2026-05-21) showed ~1/3 of dictations landing here with
+        # is_known_text=False, silently bypassing the smart leading-space +
+        # lowercase-first post-processing.
+        'Windows.UI.Input.InputSite.WindowClass',
     }
 
     # Native classes whose cursor position can be queried via Win32 messages
@@ -478,13 +485,26 @@ class InputSimulator:
                 'post_processing', 'add_leading_space_if_needed')
             want_lower = ConfigManager.get_config_value(
                 'post_processing', 'lowercase_first_letter_mid_sentence')
-            if want_space or want_lower:
+            # Strip a polish-added trailing period when dictating in the
+            # middle of a sentence — otherwise the period interrupts the
+            # in-progress sentence ("hello there.world" once the user keeps
+            # typing). Uses the same mid-sentence detection as want_lower.
+            want_strip_mid_period = ConfigManager.get_config_value(
+                'post_processing', 'strip_trailing_period_mid_sentence')
+            if want_strip_mid_period is None:
+                want_strip_mid_period = True  # default ON; user can opt out via config
+            if want_space or want_lower or want_strip_mid_period:
                 context = self._text_before_cursor(focus_hwnd, class_name)
                 prepend_space, lowercase_first = self._decide_text_adjustments(context)
                 if want_space and prepend_space:
                     text = ' ' + text
                 if want_lower and lowercase_first:
                     text = self._lowercase_first_word(text)
+                if want_strip_mid_period and lowercase_first and text.endswith('.'):
+                    # Mid-sentence: drop a single trailing '.' added by polish.
+                    # Preserve user-intentional "..." and "?" / "!" terminators.
+                    if not text.endswith('..'):
+                        text = text[:-1]
 
         # Save whatever the user had copied, paste transcription, then restore.
         # Ctrl+V is the only truly instantaneous path (browsers process WM_CHAR one at a time).
@@ -495,8 +515,27 @@ class InputSimulator:
             saved = pyperclip.paste()
         except Exception:
             saved = ''
+        try:
+            from dict_diag import dd
+            dd('typewrite.before_copy', text, focus_class=class_name,
+               is_known_text=is_known_text)
+        except Exception:
+            pass
         pyperclip.copy(text)
         time.sleep(0.05)
+        # Read back the clipboard to verify what's actually there before paste —
+        # catches races where another process overwrites the clipboard during
+        # the 50ms settle window, or where pyperclip silently fails.
+        try:
+            from dict_diag import dd
+            try:
+                clipboard_now = pyperclip.paste()
+            except Exception:
+                clipboard_now = '<paste-failed>'
+            dd('typewrite.clipboard_verify', clipboard_now,
+               matches_text=(clipboard_now == text))
+        except Exception:
+            pass
         # SendInput with explicit Alt/Shift release first — pynput's Ctrl+V
         # was opening Word's Paste Special dialog when the activation chord's
         # Alt was still virtually down. Direct SendInput also routes through

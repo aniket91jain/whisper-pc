@@ -20,18 +20,22 @@ from typing import List, Optional
 EMPTY_SENTINEL = "__EMPTY__"
 
 # Tunable: if rapidfuzz.fuzz.ratio (0-100) divided by 100 is below this, the
-# polish output is rejected as having wandered too far from raw. Plan
-# recommends starting at 0.5 and tuning empirically after a week of normal use.
-LEVENSHTEIN_REJECT_THRESHOLD = 0.5
+# polish output is rejected as having wandered too far from raw. Bumped from
+# 0.5 → 0.65 on 2026-05-20 after a confirmed "polish dropped trailing
+# instruction sentence" case (mango dictation) slipped past at similarity
+# ~0.85. Rejection costs the user a small loss of cleanup; acceptance of
+# corrupted polish costs lost content — bias toward rejecting.
+LEVENSHTEIN_REJECT_THRESHOLD = 0.65
 
 # Minimum raw-transcript length for the Levenshtein check to apply. Below
 # this, small absolute edits (case fix, period add) inflate the ratio unfairly.
 LEVENSHTEIN_MIN_RAW_CHARS = 20
 
-# Word-overlap floor as a secondary check (alongside Levenshtein). Kept as
-# belt-and-suspenders per user feedback — layer the new checks on top of the
-# battle-tested existing ones rather than replacing wholesale.
-WORD_OVERLAP_FLOOR = 0.30
+# Word-overlap floor as a secondary check (alongside Levenshtein). Bumped
+# from 0.30 → 0.50 in the same 2026-05-20 tightening — for non-catastrophic
+# drift, fraction-of-raw-words-present-in-polish stays >0.6 even when polish
+# heavily cleans up fillers; dropping below 0.5 is a strong drift signal.
+WORD_OVERLAP_FLOOR = 0.50
 WORD_OVERLAP_MIN_RAW_WORDS = 5
 
 # VoiceInk-style reasoning-tag stripper. Some Groq/OpenAI models emit
@@ -98,6 +102,12 @@ class RepairResult:
     # by llm_polish.enable_dict_autoadd_from_spelling).
     dict_additions: List[str] = field(default_factory=list)
 
+    # Drift-detection scores, populated when raw is long enough. None when
+    # raw was too short to compute meaningfully. Surfaced so callers can log
+    # the distribution and tune thresholds with data.
+    similarity: Optional[float] = None
+    overlap: Optional[float] = None
+
 
 def _strip_wrapper_tags(text: str) -> str:
     for tag in _TRANSCRIPT_WRAPPER_TAGS:
@@ -158,6 +168,64 @@ def _extract_dict_additions(text: str) -> tuple[str, List[str]]:
         words.append(cleaned)
     stripped = text[: match.start()].rstrip()
     return stripped, words
+
+
+# Common stop-words + spoken-symbol words we drop before checking trailing
+# content survival. Spoken-symbol words ("question mark", "period", etc.) get
+# converted to actual punctuation by the polish prompt, so their absence from
+# polished's tail is expected and not a sign of dropped content.
+_TRAILING_DROP_STOPWORDS = frozenset({
+    'the', 'a', 'an', 'me', 'my', 'i', 'is', 'are', 'and', 'or', 'of', 'to',
+    'in', 'on', 'at', 'for', 'with', 'as', 'by', 'this', 'that', 'it', 'be',
+    'been', 'have', 'has', 'had', 'will', 'would', 'should', 'could', 'do',
+    'does', 'did', 'so', 'if', 'then', 'than', 'us', 'we', 'you', 'your',
+    'question', 'mark', 'period', 'comma', 'exclamation', 'point', 'dot',
+    'slash', 'dash', 'colon', 'semicolon',
+})
+
+# Token regex used by the trailing-drop check. Matches alphanumeric runs.
+_TRAILING_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def _trailing_drop_detected(raw: str, polished: str) -> bool:
+    """Return True when polish appears to have dropped the trailing sentence
+    of raw — a known failure mode where reasoning models interpret a trailing
+    instruction in the transcript ("Synthesize these ideas into a note") as a
+    command directed at themselves and silently omit it.
+
+    Heuristic: extract the LAST meaningful sentence of raw (>=5 tokens) and
+    take its content words (excluding stopwords + spoken-symbol words). If
+    NONE of those content words appear anywhere in polished, polish dropped
+    the tail. Word-count ratio is intentionally not gated — a single dropped
+    sentence is a small percentage of a long dictation but matters in full.
+    """
+    raw_tokens = [t.lower() for t in _TRAILING_TOKEN_RE.findall(raw)]
+    if len(raw_tokens) < 20:
+        return False
+    polished_tokens_set = {
+        t.lower() for t in _TRAILING_TOKEN_RE.findall(polished)
+    }
+    # Walk from the end, find the last sentence with at least 5 tokens. This
+    # skips short trailing fragments ("Yes." / "OK.") whose disappearance
+    # from polish is legitimate cleanup, not a content drop.
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(raw.strip()) if s.strip()]
+    last_sentence_tokens: list[str] = []
+    for s in reversed(sentences):
+        toks = [t.lower() for t in _TRAILING_TOKEN_RE.findall(s)]
+        if len(toks) >= 5:
+            last_sentence_tokens = toks
+            break
+    if not last_sentence_tokens:
+        return False
+    content_words = [
+        t for t in last_sentence_tokens if t not in _TRAILING_DROP_STOPWORDS
+    ]
+    if len(content_words) < 3:
+        return False
+    return not any(w in polished_tokens_set for w in content_words)
 
 
 def _word_overlap_ratio(raw: str, polished: str) -> float:
@@ -231,27 +299,47 @@ def apply(raw: str, polished: Optional[str]) -> RepairResult:
             rejection_reason=f"Polish starts with bad token: {bad_token!r}",
             dict_additions=dict_additions)
 
-    # Skip similarity/overlap checks when a well-formed <<DICT_ADD>> marker
-    # was emitted: the SPELLING (dict-add) rule deletes the spoken attempt,
-    # the word "spelled", and the letter sequence, which legitimately
-    # collapses the output far below the similarity floor. The marker's
-    # presence is evidence polish did its job, not that it wandered.
-    if not dict_additions:
-        if len(raw.strip()) >= LEVENSHTEIN_MIN_RAW_CHARS:
-            similarity = _levenshtein_similarity(raw, p)
-            if similarity < LEVENSHTEIN_REJECT_THRESHOLD:
-                return RepairResult(
-                    final_text=raw, polish_rejected=True,
-                    rejection_reason=(
-                        f"Levenshtein similarity {similarity:.2f} < "
-                        f"{LEVENSHTEIN_REJECT_THRESHOLD}"))
+    # Compute drift scores eagerly so we can surface them on RepairResult
+    # (for diagnostic logging) regardless of whether they trigger rejection.
+    similarity_val: Optional[float] = None
+    overlap_val: Optional[float] = None
+    if len(raw.strip()) >= LEVENSHTEIN_MIN_RAW_CHARS:
+        similarity_val = _levenshtein_similarity(raw, p)
+    raw_words_count = sum(1 for w in raw.lower().split() if w)
+    if raw_words_count >= WORD_OVERLAP_MIN_RAW_WORDS:
+        overlap_val = _word_overlap_ratio(raw, p)
 
-        overlap = _word_overlap_ratio(raw, p)
-        if overlap < WORD_OVERLAP_FLOOR:
+    # Skip rejection checks when a well-formed <<DICT_ADD>> marker was
+    # emitted: the SPELLING (dict-add) rule deletes the spoken attempt, the
+    # word "spelled", and the letter sequence, which legitimately collapses
+    # the output far below the similarity floor.
+    if not dict_additions:
+        if similarity_val is not None and similarity_val < LEVENSHTEIN_REJECT_THRESHOLD:
             return RepairResult(
                 final_text=raw, polish_rejected=True,
-                rejection_reason=f"Word overlap {overlap:.0%} < {WORD_OVERLAP_FLOOR:.0%}")
+                rejection_reason=(
+                    f"Levenshtein similarity {similarity_val:.2f} < "
+                    f"{LEVENSHTEIN_REJECT_THRESHOLD}"),
+                similarity=similarity_val, overlap=overlap_val)
+
+        if overlap_val is not None and overlap_val < WORD_OVERLAP_FLOOR:
+            return RepairResult(
+                final_text=raw, polish_rejected=True,
+                rejection_reason=f"Word overlap {overlap_val:.0%} < {WORD_OVERLAP_FLOOR:.0%}",
+                similarity=similarity_val, overlap=overlap_val)
+
+        # Trailing-content drop: the existing similarity + overlap checks both
+        # pass when polish keeps the bulk of raw and only drops the final
+        # sentence (because the bulk dominates both metrics). Catch this
+        # specific failure mode where the polish LLM interprets a trailing
+        # instruction in the transcript as a command to itself and omits it.
+        if _trailing_drop_detected(raw, p):
+            return RepairResult(
+                final_text=raw, polish_rejected=True,
+                rejection_reason="Polish dropped trailing content of raw transcript",
+                similarity=similarity_val, overlap=overlap_val)
 
     return RepairResult(final_text=p, polish_rejected=False,
                         rejection_reason=None,
-                        dict_additions=dict_additions)
+                        dict_additions=dict_additions,
+                        similarity=similarity_val, overlap=overlap_val)

@@ -3,7 +3,7 @@ import sys
 import time
 from audioplayer import AudioPlayer
 from pynput.keyboard import Controller
-from PyQt5.QtCore import QObject, QProcess, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, QProcess, pyqtSignal
 from PyQt5.QtGui import QIcon, QCursor, QGuiApplication
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 
@@ -31,6 +31,14 @@ class _ShowRequestSignal(QObject):
     The Win32 event listener thread emits this; the queued connection delivers
     it to the GUI thread for safe widget access."""
     requested = pyqtSignal()
+
+
+class _HistoryHotkeySignal(QObject):
+    """Carrier QObject that marshals the popup hotkey from the pynput
+    keyboard-hook thread onto the Qt GUI thread. Creating QWidgets off the
+    GUI thread on Windows can deadlock the hook thread and freeze the entire
+    desktop — see Repos/plans/whisper-pc-popup-1.md for the full diagnosis."""
+    triggered = pyqtSignal()
 
 
 class WhisperPCApp(QObject):
@@ -68,7 +76,16 @@ class WhisperPCApp(QObject):
         self.key_listener = KeyListener()
         self.key_listener.add_callback("on_activate", self.on_activation)
         self.key_listener.add_callback("on_deactivate", self.on_deactivation)
-        self.key_listener.add_callback("on_history_activate", self.on_history_hotkey)
+        # History hotkey is marshaled GUI-thread via a queued signal — calling
+        # the slot directly from pynput's keyboard hook would construct widgets
+        # off-thread and can deadlock the entire desktop on Windows.
+        self._history_hotkey_signal = _HistoryHotkeySignal(self)
+        self._history_hotkey_signal.triggered.connect(
+            self._on_history_hotkey_gui, Qt.QueuedConnection,
+        )
+        self.key_listener.add_callback(
+            "on_history_activate", self._history_hotkey_signal.triggered.emit,
+        )
 
         model_options = ConfigManager.get_config_section('model_options')
         model_path = model_options.get('local', {}).get('model_path')
@@ -104,7 +121,16 @@ class WhisperPCApp(QObject):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._log_path = os.path.join(project_root, 'transcript_log.txt')
         self._failed_log_path = os.path.join(project_root, 'failed_log.txt')
-        self._history_window = None
+        # Construct the history popup once, eagerly. Toggles after this point
+        # are just show()/hide(), avoiding the lazy-init race that previously
+        # let rapid hotkey/tray clicks create dozens of duplicate windows.
+        self._history_window = TranscriptHistoryWindow(
+            self._log_path,
+            self._failed_log_path,
+            self.local_model,
+            self.input_simulator,
+        )
+        self._last_history_trigger_ts = 0.0
 
         self.main_window = MainWindow()
         self.main_window.openSettings.connect(self.settings_window.show)
@@ -197,14 +223,8 @@ class WhisperPCApp(QObject):
 
     def _open_transcript_log(self, near_cursor=False):
         if self._history_window is None:
-            self._history_window = TranscriptHistoryWindow(
-                self._log_path,
-                self._failed_log_path,
-                self.local_model,
-                self.input_simulator,
-            )
-        else:
-            self._history_window._load()
+            return  # not initialized (config-less first-run path); ignore
+        self._history_window.refresh()
         if near_cursor:
             self._position_window_near_cursor(self._history_window)
         self._history_window.show()
@@ -222,10 +242,16 @@ class WhisperPCApp(QObject):
         y = min(max(cursor_pos.y() + 12, screen_geo.top()), screen_geo.bottom() - h)
         window.move(x, y)
 
-    def on_history_hotkey(self):
-        """Ditto-style toggle: hotkey opens the history popup near the cursor,
-        or hides it if already visible. Window keeps focus on the underlying
-        app so a click on a card pastes into the active field."""
+    _HISTORY_DEBOUNCE_SEC = 0.2
+
+    def _on_history_hotkey_gui(self):
+        """Ditto-style toggle on the GUI thread. Always invoked via the
+        QueuedConnection from _history_hotkey_signal — do NOT call directly
+        from the keyboard-hook thread."""
+        now = time.time()
+        if now - self._last_history_trigger_ts < self._HISTORY_DEBOUNCE_SEC:
+            return
+        self._last_history_trigger_ts = now
         if self._history_window is not None and self._history_window.isVisible():
             self._history_window.hide()
             return
@@ -326,18 +352,28 @@ class WhisperPCApp(QObject):
         on disk; just refresh the history window so the user sees the new row."""
         ConfigManager.console_print(f'Transcription failed; audio saved to {audio_path} ({reason})')
         if self._history_window is not None and self._history_window.isVisible():
-            self._history_window._load()
+            self._history_window.refresh()
 
     def on_transcription_complete(self, result):
         """
         When the transcription is complete, type the result and start listening for the activation key again.
         """
+        try:
+            from dict_diag import dd
+            dd('main.on_transcription_complete', result)
+        except Exception:
+            pass
         # Empty result reaches here on silent recordings (status overlay shows
         # "Nothing transcribable detected") and on API failures. Skip the paste
         # so we don't clobber the user's clipboard or fire a stray Ctrl+V — but
         # still run beep / re-arm so the activation flow stays consistent.
         if result and result.strip():
             self.input_simulator.typewrite(result)
+
+        # If the popup is currently open, tail-read the new entry so the user
+        # sees it appear at the top without having to click Refresh.
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.refresh()
 
         if ConfigManager.get_config_value('misc', 'noise_on_completion'):
             AudioPlayer(os.path.join('assets', 'beep.wav')).play(block=True)

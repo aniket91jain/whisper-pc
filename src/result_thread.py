@@ -110,6 +110,11 @@ class ResultThread(QThread):
                 return
 
             self.statusSignal.emit('idle')
+            try:
+                from dict_diag import dd
+                dd('result_thread.emit', result)
+            except Exception:
+                pass
             self.resultSignal.emit(result)
 
         except TranscriptionAPIError as e:

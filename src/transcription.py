@@ -764,7 +764,10 @@ def _transcribe_via_elevenlabs(audio_data):
 
     if result.get('error'):
         ConfigManager.console_print(f'ElevenLabs RT failed: {result["error"]}')
-        raise TranscriptionAPIError(f"ElevenLabs RT: {result['error']}")
+        # v0.3.1: classify the failure so the caller (result_thread) can show
+        # a short user-facing chip ("No internet", "Network slow", etc.)
+        category = _classify_elevenlabs_failure(result['error'])
+        raise TranscriptionAPIError(f"ElevenLabs RT: {result['error']} [{category}]")
 
     raw_text = result.get('text') or ''
     ConfigManager.console_print(f'ElevenLabs RT in {elapsed_ms}ms: "{raw_text.strip()}"')
@@ -788,6 +791,40 @@ def _transcribe_via_elevenlabs(audio_data):
         pass
 
     return polish_result.final_text
+
+
+def _classify_elevenlabs_failure(reason: str) -> str:
+    """Map a raw failure reason to a 2-3 word user-facing label.
+
+    Mirrors mobile's classifyFailureReason() in WhisperAccessibilityService.kt.
+    """
+    if not reason:
+        return "Transcription failed"
+    # Network up at all? socket.gethostbyname is a cheap-ish probe.
+    try:
+        import socket
+        socket.gethostbyname("api.elevenlabs.io")
+        online = True
+    except Exception:
+        online = False
+    if not online:
+        return "No internet"
+    lower = reason.lower()
+    if "timed out" in lower or "timeout" in lower:
+        return "Network slow"
+    if "ws closed" in lower or "ws failure" in lower or "connection closed" in lower:
+        return "Connection dropped"
+    if "http 5" in lower or "internal_error" in lower or "service unavailable" in lower:
+        return "Server error"
+    if "http 4" in lower or "rate limit" in lower or "quota" in lower:
+        return "API limit / auth"
+    if "api key" in lower:
+        return "Key not set"
+    if "blocked" in lower or "vpn" in lower:
+        return "Blocked (VPN?)"
+    if "empty" in lower:
+        return "No speech detected"
+    return "Transcription failed"
 
 
 def _audio_data_to_pcm16_bytes(audio_data) -> bytes:
