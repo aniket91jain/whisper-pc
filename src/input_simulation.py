@@ -1,9 +1,11 @@
 import subprocess
 import os
 import signal
+import threading
 import time
 import ctypes
 import ctypes.wintypes
+from collections import deque
 import pyperclip
 from pynput.keyboard import Controller as PynputController, Key
 
@@ -97,6 +99,18 @@ class InputSimulator:
         'paneClassDC',      # PowerPoint
     }
 
+    # Clipboard-restore tuning. We're not blocking the GUI thread on this
+    # wait anymore (it runs on a daemon background thread per paste), so
+    # we can afford a generous margin to cover even slow WinUI 3 paste
+    # handlers without the user perceiving any latency.
+    _CLIPBOARD_RESTORE_DELAY_S = 0.35
+    # Ring of recent transcripts we've placed on the clipboard. Used by
+    # _refresh_user_clipboard_cache to distinguish "current clipboard is
+    # the user's real content" from "current clipboard is our own paste
+    # whose restore hasn't fired yet". Tiny ring; 16 covers any plausible
+    # rapid-dictation burst.
+    _RECENT_PASTE_RING_MAX = 16
+
     def __init__(self):
         """
         Initialize the InputSimulator with the specified configuration.
@@ -104,10 +118,36 @@ class InputSimulator:
         self.input_method = ConfigManager.get_config_value('post_processing', 'input_method')
         self.dotool_process = None
 
+        # Async-restore state. The "user clipboard cache" is the last
+        # observed clipboard content that wasn't one of our own pastes —
+        # i.e. what the user actually wants preserved. _our_recent_pastes
+        # tags each transcript we put on the clipboard so the cache update
+        # logic can tell its own pastes apart from real user copies.
+        # Lock serialises the read-current / decide-to-update / update
+        # sequence in case two dictations overlap (cooldown prevents this
+        # in practice, but threads are cheap to protect).
+        self._user_clipboard_cache = None
+        self._our_recent_pastes: deque[str] = deque(maxlen=self._RECENT_PASTE_RING_MAX)
+        self._clipboard_state_lock = threading.Lock()
+
         if self.input_method in ('pynput', 'clipboard'):
             self.keyboard = PynputController()
         elif self.input_method == 'dotool':
             self._initialize_dotool()
+
+    def _refresh_user_clipboard_cache(self) -> None:
+        """Update _user_clipboard_cache to the current clipboard *only* if
+        the current clipboard isn't something we put there ourselves. Run
+        right before each paste so the saved value reflects the user's
+        actual previous clipboard, not a stale transcript from an
+        in-flight restore."""
+        try:
+            current = pyperclip.paste()
+        except Exception:
+            return
+        with self._clipboard_state_lock:
+            if current and current not in self._our_recent_pastes:
+                self._user_clipboard_cache = current
 
     def _initialize_dotool(self):
         """
@@ -506,15 +546,22 @@ class InputSimulator:
                     if not text.endswith('..'):
                         text = text[:-1]
 
-        # Save whatever the user had copied, paste transcription, then restore.
-        # Ctrl+V is the only truly instantaneous path (browsers process WM_CHAR one at a time).
-        # We paste even for unknown-class focus targets (Word's _WwG, modern Notepad,
-        # etc.) — Ctrl+V is universally "paste" and is harmless if the focus turns
+        # Save whatever the user had copied, paste transcription, restore
+        # asynchronously. Ctrl+V is the only truly instantaneous path
+        # (browsers process WM_CHAR one at a time). We paste even for
+        # unknown-class focus targets (Word's _WwG, modern Notepad, etc.) —
+        # Ctrl+V is universally "paste" and is harmless if the focus turns
         # out to not accept text.
-        try:
-            saved = pyperclip.paste()
-        except Exception:
-            saved = ''
+        #
+        # Refresh the cached "user clipboard" view from the system clipboard
+        # right now. The cache is what we'll restore to after paste; pulling
+        # it now (instead of just before restore) means rapid back-to-back
+        # dictations don't accidentally save each other's transcripts as the
+        # "user value" — see _refresh_user_clipboard_cache for the logic.
+        self._refresh_user_clipboard_cache()
+        with self._clipboard_state_lock:
+            saved_for_restore = self._user_clipboard_cache
+            self._our_recent_pastes.append(text)
         try:
             from dict_diag import dd
             dd('typewrite.before_copy', text, focus_class=class_name,
@@ -541,23 +588,46 @@ class InputSimulator:
         # Alt was still virtually down. Direct SendInput also routes through
         # Word's accelerator handling more reliably.
         self._send_ctrl_v()
-        # Wait long enough for the target's paste handler to consume the
-        # clipboard before we restore the previous contents. 300ms is the
-        # empirically-safe value across every app we paste into.
+        # Async restore on a daemon thread — the GUI returns immediately
+        # and the perceived paste-latency is ~0. The thread waits long
+        # enough for any target's paste handler to consume the clipboard
+        # (300+ms is the empirically-safe value across WinUI 3 / Office /
+        # Chrome / native Win32), then restores — but only if the
+        # clipboard still contains our transcript. If something else has
+        # touched the clipboard since (a follow-up dictation, a user copy,
+        # a clipboard manager), we skip the restore so we don't clobber.
         #
-        # An earlier optimisation tried a class-name branch (60ms for
-        # non-Office, 300ms only for Word/Excel/PPT body) but it caused
-        # intermittent "previous-clipboard-pasted-instead-of-transcript"
-        # races on WinUI 3 targets (modern Outlook, Loop, Teams new,
-        # Notepad 11). The InputSite window in those apps runs the paste
-        # handler on a separate thread and the 60ms restore can land
-        # before paste is processed — the app then reads the user's
-        # previously-copied content. Reverted 2026-05-23.
-        time.sleep(0.3)
-        try:
-            pyperclip.copy(saved)
-        except Exception:
-            pass
+        # This is the corrected version of the perf optimisation that
+        # tripped on 2026-05-23: previously we synchronously slept 300ms
+        # (laggy), then I tried a 60ms class-name branch (raced WinUI 3),
+        # now we sleep on a background thread + guard against stale
+        # restores.
+        target_text = text
+        target_restore = saved_for_restore
+        def _restore_clipboard_async() -> None:
+            time.sleep(self._CLIPBOARD_RESTORE_DELAY_S)
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                return
+            # If the clipboard moved on from our transcript, don't touch it.
+            # Covers: (a) a second dictation pasted over us, (b) the user
+            # copied something new, (c) a clipboard manager rotated the
+            # clipboard. In all three cases the right thing is to leave
+            # the current value alone.
+            if current != target_text:
+                return
+            if target_restore is None:
+                return  # nothing meaningful to restore to
+            try:
+                pyperclip.copy(target_restore)
+            except Exception:
+                pass
+        threading.Thread(
+            target=_restore_clipboard_async,
+            name='clipboard-restore',
+            daemon=True,
+        ).start()
 
     def _typewrite_pynput(self, text, interval):
         """
