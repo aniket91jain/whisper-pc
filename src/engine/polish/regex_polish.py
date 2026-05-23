@@ -24,7 +24,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from . import alphanumeric_nato, email_shorthand, proper_noun_fixes, scratch_handler, spelling_capture
+from . import (
+    alphanumeric_nato,
+    backchannel_strip,
+    email_shorthand,
+    proper_noun_fixes,
+    scratch_handler,
+    spelling_capture,
+)
 
 
 @dataclass
@@ -113,6 +120,13 @@ def apply(raw_from_stt: str, toggles: Toggles | None = None) -> Result:
     # Step 7: expand voice-format placeholders to real newlines.
     s = re.sub(r"\s*\[blank\s*line\]\s*", "\n\n", s)
     s = re.sub(r"\s*\[newline\]\s*", "\n", s)
+
+    # Step 7.5: strip standalone backchannels ("Mm-hmm.", "Hmm.", "Uh-huh.")
+    # that Scribe RT injects during long pauses. Done after scratch (so any
+    # "Mm-hmm. Scratch that. Real" survives the scratch transform) and
+    # after newline expansion (so backchannels in their own paragraphs
+    # are also caught at line boundaries).
+    s = backchannel_strip.apply(s)
 
     # Step 8: final cleanup — same idempotent passes used by the existing
     # RegexPrePass mobile equivalent (capitalization, terminal punctuation,
