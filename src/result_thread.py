@@ -1,5 +1,6 @@
 import datetime
 import os
+import threading
 import time
 import traceback
 import numpy as np
@@ -14,6 +15,66 @@ from threading import Event
 
 from transcription import transcribe, transcribe_streaming_result, TranscriptionAPIError
 from utils import ConfigManager
+
+
+# Phase-timing diagnostics file. pythonw.exe has no console, so console_print()
+# output goes to the void — when a transcription hangs, there's no way to tell
+# which phase wedged. This sink writes one short line per phase boundary to a
+# dedicated log so the next stuck attempt is debuggable from the on-disk file.
+_PHASE_DIAG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'transcribe_diag.log',
+)
+# Rotate at ~512 KB so the file doesn't grow unbounded; truncate to keep the
+# tail (the bit we'd actually want to read after a hang).
+_PHASE_DIAG_MAX_BYTES = 512 * 1024
+
+
+class _PhaseDiagWriter:
+    """Per-ResultThread instance writer. Stamps each phase with monotonic
+    elapsed-since-construction so the gaps between phases are obvious at a
+    glance. Failures are swallowed — diagnostics must never break dictation."""
+
+    def __init__(self) -> None:
+        self._t0 = time.monotonic()
+        # Single header line per run, so an audit reader can see where one
+        # dictation starts and the previous one ends.
+        try:
+            self._truncate_if_huge()
+            with open(_PHASE_DIAG_PATH, 'a', encoding='utf-8') as f:
+                f.write(
+                    f'--- {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]} '
+                    f'thread_id={id(self):x} ---\n'
+                )
+        except Exception:
+            pass
+
+    def mark(self, phase: str, **fields) -> None:
+        try:
+            elapsed_ms = int((time.monotonic() - self._t0) * 1000)
+            extra = ''
+            if fields:
+                extra = ' ' + ' '.join(f'{k}={v!r}' for k, v in fields.items())
+            with open(_PHASE_DIAG_PATH, 'a', encoding='utf-8') as f:
+                f.write(f'+{elapsed_ms:>7}ms  {phase}{extra}\n')
+        except Exception:
+            pass
+
+    @staticmethod
+    def _truncate_if_huge() -> None:
+        try:
+            if os.path.exists(_PHASE_DIAG_PATH) and \
+                    os.path.getsize(_PHASE_DIAG_PATH) > _PHASE_DIAG_MAX_BYTES:
+                # Keep the last quarter — the bit most likely to contain the
+                # hang we want to debug.
+                with open(_PHASE_DIAG_PATH, 'rb') as f:
+                    f.seek(-_PHASE_DIAG_MAX_BYTES // 4, os.SEEK_END)
+                    tail = f.read()
+                with open(_PHASE_DIAG_PATH, 'wb') as f:
+                    f.write(b'--- [truncated] ---\n')
+                    f.write(tail)
+        except Exception:
+            pass
 
 
 class ResultThread(QThread):
@@ -36,6 +97,10 @@ class ResultThread(QThread):
     statusSignal = pyqtSignal(str)
     resultSignal = pyqtSignal(str)
     failedSignal = pyqtSignal(str, str)
+    # Engine label (e.g. 'elevenlabs-stream', 'groq+llama') of the just-finished
+    # dictation, emitted just before the result so the GUI can flash a brief
+    # "transcribed by X" toast next to the recording bubble.
+    engineSignal = pyqtSignal(str)
 
     def __init__(self, local_model=None, audio_capture_service=None, session_pool=None):
         """
@@ -61,6 +126,14 @@ class ResultThread(QThread):
         # so the resulting recording omits the paused span. The InputStream
         # itself keeps running (avoids re-init latency); we just drop frames.
         self.is_paused = False
+        # Cancel flag — set by cancel() when the user hits the × badge on the
+        # bubble. Checked at every yield point in run() so the captured audio
+        # is discarded, no transcription is committed, no paste fires, and no
+        # failed-audio is persisted. The thread is allowed to wind down on its
+        # own — main.py disconnects the result/failed signals so any late
+        # emissions are ignored. Non-blocking by design (a hard wait() on a
+        # stuck network call would freeze the GUI).
+        self.is_cancelled = False
         self.sample_rate = None
         self.mutex = QMutex()
         # v0.3.2 PC: streaming-during-recording session. Open before recording
@@ -69,6 +142,24 @@ class ResultThread(QThread):
         # streaming is disabled or for the Groq path.
         self._stream_session = None
         self._stream_failed_reason: str | None = None
+        # v0.4 PC: pause-segmented streaming. A long pause kills ElevenLabs'
+        # WebSocket (server idle/session-time/queue limits — see
+        # engine/stt/elevenlabs_rt.py). Rather than hold one socket open across
+        # the pause (which always fails on hour-long gaps), each spoken span is
+        # its own short-lived session: commit-on-pause finalizes the span and
+        # stashes its text here; resume opens a fresh session; stop stitches the
+        # spans together. `_streaming_in_use` records that this dictation took
+        # the streaming path at all (so resume knows to re-open). Any span that
+        # fails to stream sets `_stream_failed_reason`, which makes stop fall
+        # back to a single Groq burst over the full (speech-only) audio buffer.
+        self._stream_segments: list[str] = []
+        self._streaming_in_use = False
+        self._pause_commit_thread: threading.Thread | None = None
+        self._stream_lock = threading.Lock()
+        # Phase-diag writer for the current dictation (set in run()). pause/
+        # resume stamp it so any future post-resume drop is visible in
+        # transcribe_diag.log without needing to reproduce under a console.
+        self._diag = None
 
     def stop_recording(self):
         """Stop the current recording session."""
@@ -82,24 +173,62 @@ class ResultThread(QThread):
 
     def pause_recording(self):
         """Pause the audio-capture loop. Frames received while paused are
-        discarded so the resulting recording skips over the paused span."""
+        discarded so the resulting recording skips over the paused span.
+
+        v0.4: also finalizes the current ElevenLabs streaming span. The span's
+        text is committed and stashed so a long pause (which would otherwise
+        kill the idle WebSocket) cannot lose it; resume opens a fresh session.
+        """
         self.mutex.lock()
         if self.is_recording and not self.is_paused:
             self.is_paused = True
             self.mutex.unlock()
+            if self._diag is not None:
+                self._diag.mark('pause')
             self.statusSignal.emit('paused')
+            self._rotate_streaming_session_on_pause()
         else:
             self.mutex.unlock()
 
     def resume_recording(self):
-        """Resume capture after a pause."""
+        """Resume capture after a pause.
+
+        v0.4.1 (data-loss fix): clear is_paused FIRST, *before* reopening the
+        streaming session. The capture loop gates every appended frame on
+        is_paused, so post-resume speech must reach the `recording` buffer the
+        instant the user resumes. The old order reopened the session first and
+        only cleared is_paused afterwards — so the entire reopen window (a warm-
+        pool handoff, up to ~2s on the blocking fallback open, or *forever* if
+        the reopen raised) was still treated as paused and silently discarded.
+        That was the "everything after the pause is missed" bug: the pre-pause
+        span committed fine, the post-resume audio never entered the buffer, and
+        stop reported success (delivered=True, no error) with only the early
+        spans. Mirrors mobile, which already sets state=RECORDING before reopen.
+
+        Reopen is now best-effort and guarded: any frame captured before the
+        fresh session is live is still in `recording`, and _feed_streaming_session
+        marks the stream incomplete so stop bursts the full buffer. Words can no
+        longer be lost regardless of how the reopen goes.
+        """
         self.mutex.lock()
-        if self.is_recording and self.is_paused:
-            self.is_paused = False
+        if not (self.is_recording and self.is_paused):
             self.mutex.unlock()
-            self.statusSignal.emit('recording')
-        else:
-            self.mutex.unlock()
+            return
+        self.is_paused = False
+        self.mutex.unlock()
+        if self._diag is not None:
+            self._diag.mark('resume')
+        self.statusSignal.emit('recording')
+        try:
+            self._reopen_streaming_session_on_resume()
+        except Exception as e:
+            ConfigManager.console_print(
+                f'Resume reopen raised ({e}); capture continues into the buffer, '
+                f'will burst full audio on stop'
+            )
+            self._stream_failed_reason = (
+                self._stream_failed_reason or f'resume reopen error: {e}'
+            )
 
     def toggle_pause(self):
         """Single-shortcut helper: pause if recording, resume if paused."""
@@ -122,10 +251,45 @@ class ResultThread(QThread):
         self.statusSignal.emit('idle')
         self.wait()
 
+    def cancel(self):
+        """User pressed × on the bubble — abort recording and any in-flight
+        STT call. Discards captured audio and emits no result.
+
+        Non-blocking: this returns immediately so the GUI thread is free to
+        hide the bubble even if the worker is wedged inside a slow Groq
+        upload. The worker thread itself is left running and checks the
+        is_cancelled flag at every yield point. Main wires this to disconnect
+        the resultSignal/failedSignal so any late emit from the dying thread
+        does nothing.
+
+        Side effects:
+          - Sets is_cancelled, clears is_recording/is_paused.
+          - Hard-aborts any open ElevenLabs streaming session (closes the WS
+            so it stops uploading audio bytes the user no longer wants sent).
+        """
+        self.mutex.lock()
+        self.is_cancelled = True
+        self.is_recording = False
+        self.is_paused = False
+        self.mutex.unlock()
+        # Closing the WS here is the actually-effective abort: it short-
+        # circuits both the streaming-commit path (forces an error so the
+        # 7s wait returns immediately) and the burst path (the WS is the
+        # transport). For the Groq path there's nothing comparable — the
+        # openai SDK doesn't expose mid-call cancellation, so that path
+        # finishes naturally and the result is discarded by the is_cancelled
+        # check in run().
+        self._cancel_streaming_session()
+        self.statusSignal.emit('cancel')
+
     def run(self):
         """Main execution method for the thread."""
         audio_data = None
         consumer = None
+        diag = _PhaseDiagWriter()
+        # Expose the writer to pause_recording / resume_recording (which run on
+        # the GUI thread) so pause/resume transitions land in the same diag log.
+        self._diag = diag
         try:
             if not self.is_running:
                 return
@@ -160,14 +324,32 @@ class ResultThread(QThread):
             # pool (zero latency). Fall back to in-record open (the legacy
             # ~300-1500 ms blocking handshake) when the pool isn't enabled or
             # has no warm session ready.
+            #
+            # Reset the per-dictation pause-segment state here (NOT inside
+            # _acquire_warm_session_or_open — that also runs on resume, which
+            # must preserve segments + any failure from earlier spans).
+            self._stream_segments = []
+            self._streaming_in_use = False
+            self._pause_commit_thread = None
+            self._stream_failed_reason = None
             self._acquire_warm_session_or_open()
 
             self.statusSignal.emit('recording')
             ConfigManager.console_print('Recording...')
+            diag.mark('record_start', warm=use_warm_capture,
+                      has_stream=self._stream_session is not None)
             if consumer is not None:
                 audio_data = self._record_audio_from_consumer(consumer)
             else:
                 audio_data = self._record_audio()
+            audio_samples = int(audio_data.size) if audio_data is not None else 0
+            diag.mark('record_end', samples=audio_samples)
+
+            if self.is_cancelled:
+                ConfigManager.console_print('Cancelled during recording; discarding audio')
+                diag.mark('cancelled', stage='post_record')
+                self._cancel_streaming_session()
+                return
 
             if not self.is_running:
                 self._cancel_streaming_session()
@@ -180,12 +362,25 @@ class ResultThread(QThread):
 
             self.statusSignal.emit('transcribing')
             ConfigManager.console_print('Transcribing...')
+            diag.mark('transcribe_start')
 
             start_time = time.time()
+            diag.mark('stream_commit_start')
             streaming_text = self._commit_streaming_session(audio_data)
+            diag.mark('stream_commit_end',
+                      delivered=streaming_text is not None,
+                      stream_failed_reason=self._stream_failed_reason)
+
+            if self.is_cancelled:
+                ConfigManager.console_print('Cancelled during transcription; discarding result')
+                diag.mark('cancelled', stage='post_stream_commit')
+                return
+
             if streaming_text is not None:
                 # ElevenLabs streaming delivered text; just polish.
+                diag.mark('polish_streaming_start')
                 result = transcribe_streaming_result(streaming_text)
+                diag.mark('polish_streaming_end')
             else:
                 # No streaming, or streaming failed. Force Groq when streaming
                 # was attempted-and-failed so we don't re-hit ElevenLabs burst
@@ -193,11 +388,19 @@ class ResultThread(QThread):
                 # (Mirrors mobile v0.3.4 forceGroq path.)
                 streaming_failed = self._stream_failed_reason is not None
                 self._stream_failed_reason = None
+                diag.mark('transcribe_burst_start', force_groq=streaming_failed)
                 result = transcribe(audio_data, self.local_model, force_groq=streaming_failed)
+                diag.mark('transcribe_burst_end',
+                          result_chars=len(result) if result else 0)
             end_time = time.time()
 
             transcription_time = end_time - start_time
             ConfigManager.console_print(f'Transcription completed in {transcription_time:.2f} seconds. Post-processed line: {result}')
+
+            if self.is_cancelled:
+                ConfigManager.console_print('Cancelled before paste; discarding result')
+                diag.mark('cancelled', stage='post_transcribe')
+                return
 
             if not self.is_running:
                 return
@@ -217,22 +420,40 @@ class ResultThread(QThread):
                 dd('result_thread.emit', result)
             except Exception:
                 pass
+            # Surface which backend produced this text (toast). Emit before the
+            # result so the hint is up as the paste lands. consume_last_engine()
+            # reads the thread-local set inside transcribe()/the streaming path.
+            try:
+                from transcription import consume_last_engine
+                engine = consume_last_engine()
+                if engine:
+                    self.engineSignal.emit(engine)
+            except Exception:
+                pass
             self.resultSignal.emit(result)
 
         except TranscriptionAPIError as e:
             traceback.print_exc()
             ConfigManager.console_print(f'Transcription API failure: {e.reason}')
-            if audio_data is not None and audio_data.size > 0:
+            diag.mark('api_error', reason=e.reason)
+            # Don't persist or surface anything if the user already cancelled.
+            # The exception may have arisen as a side effect of cancel() closing
+            # the streaming WS; we don't want a stale failed/ entry for that.
+            if audio_data is not None and audio_data.size > 0 and not self.is_cancelled:
                 self._persist_failed_recording(audio_data, e.reason)
-            self.statusSignal.emit('error')
-            # Emit empty result so the existing post-completion flow runs
-            # (key listener restart, continuous-mode re-arm).
-            self.resultSignal.emit('')
+            if not self.is_cancelled:
+                self.statusSignal.emit('error')
+                # Emit empty result so the existing post-completion flow runs
+                # (key listener restart, continuous-mode re-arm).
+                self.resultSignal.emit('')
         except Exception as e:
             traceback.print_exc()
-            self.statusSignal.emit('error')
-            self.resultSignal.emit('')
+            diag.mark('exception', cls=type(e).__name__, msg=str(e)[:200])
+            if not self.is_cancelled:
+                self.statusSignal.emit('error')
+                self.resultSignal.emit('')
         finally:
+            diag.mark('finally', cancelled=self.is_cancelled)
             self.stop_recording()
             # Make sure no streaming session is left dangling — _commit_*
             # already clears self._stream_session on success/failure, but the
@@ -284,9 +505,12 @@ class ResultThread(QThread):
         in-record open (blocks up to 2s on the WS handshake) for safety.
 
         Sets self._stream_session to a ready Session, or None.
+
+        Note: per-dictation reset of _stream_failed_reason / _stream_segments
+        lives in run(); this method ALSO runs on resume and must not wipe text
+        or failures accumulated from earlier spans of the same dictation.
         """
         self._stream_session = None
-        self._stream_failed_reason = None
 
         # Pool fast-path — only attempted when the pool is enabled. Returns
         # an already-ready Session with keepalive running.
@@ -295,6 +519,7 @@ class ResultThread(QThread):
             warm = pool.acquire()
             if warm is not None:
                 self._stream_session = warm
+                self._streaming_in_use = True
                 ConfigManager.console_print(
                     'Acquired warm streaming session from pool (0ms WS handshake)'
                 )
@@ -316,7 +541,6 @@ class ResultThread(QThread):
         to a ready Session, or None.
         """
         self._stream_session = None
-        self._stream_failed_reason = None
 
         stt_engine = ConfigManager.get_config_value('model_options', 'stt_engine') or 'groq'
         if stt_engine != 'elevenlabs':
@@ -366,12 +590,27 @@ class ResultThread(QThread):
             return
 
         self._stream_session = session
+        self._streaming_in_use = True
         ConfigManager.console_print(f'Streaming session opened (keyterms={len(keyterms)})')
 
     def _feed_streaming_session(self, pcm_frame: np.ndarray) -> None:
         """Forward one captured PCM frame to the streaming session, if any."""
         session = self._stream_session
         if session is None:
+            # We were handed a (non-paused) frame but hold no live session.
+            # When this dictation is taking the streaming path, that frame is
+            # now missing from the stream — e.g. the brief resume window before
+            # the fresh session becomes live. The frame is safe in `recording`,
+            # but the streamed spans are no longer complete, so force the stop
+            # path to burst the full audio buffer rather than stitch partial
+            # spans (which would drop the start of the post-resume span).
+            if self._streaming_in_use and self._stream_failed_reason is None:
+                self._stream_failed_reason = (
+                    'capture outran live stream (resume gap); bursting full audio'
+                )
+                ConfigManager.console_print(
+                    'Frame captured with no live stream; will burst full audio on stop'
+                )
             return
         if not session.is_ready():
             # Session died during recording — note the reason once and stop
@@ -388,18 +627,13 @@ class ResultThread(QThread):
             self._stream_failed_reason = f'send failed: {e}'
             self._stream_session = None
 
-    def _commit_streaming_session(self, full_audio: np.ndarray) -> str | None:
-        """Commit the streaming session and wait for the final transcript.
+    def _commit_session_blocking(self, session, timeout: float = 7.0) -> tuple[str | None, str | None]:
+        """Commit ONE streaming session and block (≤ timeout) for its text.
 
-        Returns the finalised text string when streaming delivered usable
-        output. Returns None when streaming wasn't active or it failed —
-        caller should fall through to the burst path on `full_audio`.
+        Returns (text, error): `text` is the finalised span text (None if empty
+        or on failure); `error` is a human reason string when the commit failed.
+        Used for both the per-pause span commit and the final-span commit.
         """
-        session = self._stream_session
-        if session is None:
-            return None
-        self._stream_session = None
-
         from threading import Event as _Event
         done_event = _Event()
         result_holder: dict = {}
@@ -411,40 +645,139 @@ class ResultThread(QThread):
         try:
             session.commit(on_result)
         except Exception as e:
-            ConfigManager.console_print(f'Streaming commit raised: {e}; falling back to burst')
-            return None
+            return None, f'commit raised: {e}'
 
-        # Mobile uses a 5s in-session watchdog plus a 7s service-level safety
-        # net. Mirror that here: wait up to 7s for the final transcript.
-        if not done_event.wait(timeout=7.0):
-            ConfigManager.console_print('Streaming commit timed out (>7s); falling back to burst')
+        # ElevenLabs RT finalises in <1s healthy; 7s catches real hangs.
+        if not done_event.wait(timeout=timeout):
             try:
                 session.cancel()
             except Exception:
                 pass
-            return None
+            return None, f'commit timed out (>{timeout:.0f}s)'
 
         if result_holder.get('error'):
-            ConfigManager.console_print(f'Streaming commit failed: {result_holder["error"]}; falling back to burst')
-            return None
+            return None, result_holder['error']
 
         text = (result_holder.get('text') or '').strip()
-        if not text:
-            ConfigManager.console_print('Streaming commit returned empty text; falling back to burst')
-            return None
+        return (text or None), None
 
-        ConfigManager.console_print(f'Streaming delivered {len(text)} chars; skipping burst STT')
-        return text
+    def _rotate_streaming_session_on_pause(self) -> None:
+        """Finalize the current streaming span when the user pauses.
+
+        Commits the open session on a daemon thread (so the GUI never blocks),
+        stashing the span text in _stream_segments. The pre-pause socket is
+        then done — a long pause can't lose its text or trip the server idle/
+        session/queue limits. Resume opens a fresh socket. If the commit fails,
+        mark _stream_failed_reason so stop bursts the full audio instead.
+        """
+        with self._stream_lock:
+            session = self._stream_session
+            self._stream_session = None
+            if session is None:
+                return
+
+            def _do_commit(sess=session):
+                text, error = self._commit_session_blocking(sess, timeout=7.0)
+                if error:
+                    ConfigManager.console_print(f'Pause-commit failed: {error}; will burst on stop')
+                    self._stream_failed_reason = self._stream_failed_reason or error
+                    return
+                if text:
+                    with self._stream_lock:
+                        self._stream_segments.append(text)
+                    ConfigManager.console_print(
+                        f'Pause-commit stashed span ({len(text)} chars; '
+                        f'{len(self._stream_segments)} span(s) so far)'
+                    )
+
+            self._pause_commit_thread = threading.Thread(
+                target=_do_commit, name='elevenlabs-pause-commit', daemon=True,
+            )
+            self._pause_commit_thread.start()
+
+    def _join_pause_commit(self, timeout: float = 8.0) -> None:
+        """Wait for an in-flight pause-commit to finish (if any)."""
+        t = self._pause_commit_thread
+        if t is not None:
+            t.join(timeout=timeout)
+            self._pause_commit_thread = None
+
+    def _reopen_streaming_session_on_resume(self) -> None:
+        """Open a fresh streaming session for the span after a pause.
+
+        Re-acquires (the pool usually has a warm spare, so this is ~instant). If
+        streaming was in use but re-acquire yields nothing, mark a failure so
+        stop bursts the full audio — post-resume speech is still captured in the
+        recording buffer, so nothing is lost.
+
+        v0.4.1: no longer joins the pause-commit here. That join only existed to
+        keep span order, but stop's _commit_streaming_session already joins
+        before it reads _stream_segments, so ordering still holds — and joining
+        on the resume path needlessly blocked the GUI thread (up to the 8s commit
+        timeout) while the user had already resumed talking.
+        """
+        if not self._streaming_in_use:
+            return
+        self._acquire_warm_session_or_open()
+        if self._stream_session is None and not self._stream_failed_reason:
+            self._stream_failed_reason = 'could not reopen streaming session on resume'
+            ConfigManager.console_print(
+                'Resume could not reopen streaming session; will burst full audio on stop'
+            )
+
+    def _commit_streaming_session(self, full_audio: np.ndarray) -> str | None:
+        """Commit the final span and stitch all spans into the result.
+
+        Returns the finalised (stitched) text when streaming was used and every
+        span succeeded. Returns None when streaming wasn't used or any span
+        failed — caller falls through to a single burst over `full_audio`
+        (which holds every spoken span; paused gaps were already dropped). The
+        all-or-burst rule avoids both gaps and double-transcription.
+        """
+        # A pause may have left a commit in flight — let it land so its span is
+        # included and ordered before the final one.
+        self._join_pause_commit()
+
+        with self._stream_lock:
+            session = self._stream_session
+            self._stream_session = None
+
+        final_text = None
+        if session is not None:
+            final_text, error = self._commit_session_blocking(session, timeout=7.0)
+            if error:
+                ConfigManager.console_print(f'Final-span commit failed: {error}; falling back to burst')
+                self._stream_failed_reason = self._stream_failed_reason or error
+
+        if not self._streaming_in_use:
+            return None  # Groq path — no streamed text to deliver
+        if self._stream_failed_reason:
+            return None  # some span failed → burst the whole audio instead
+
+        with self._stream_lock:
+            parts = list(self._stream_segments)
+        if final_text:
+            parts.append(final_text)
+        combined = ' '.join(p for p in parts if p).strip()
+        if not combined:
+            ConfigManager.console_print('Streaming produced no text; falling back to burst')
+            return None
+        ConfigManager.console_print(
+            f'Streaming delivered {len(combined)} chars across {len(parts)} span(s); skipping burst STT'
+        )
+        return combined
 
     def _cancel_streaming_session(self) -> None:
         """Abort streaming without committing (user cancelled / empty audio)."""
-        session = self._stream_session
+        with self._stream_lock:
+            session = self._stream_session
+            self._stream_session = None
+            self._stream_segments = []
         if session is not None:
             try:
                 session.cancel()
             except Exception:
                 pass
-        self._stream_session = None
 
     # ---- recording loop ----
 

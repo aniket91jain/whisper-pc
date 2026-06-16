@@ -54,6 +54,14 @@ KEEPALIVE_INTERVAL_S = 10  # ElevenLabs RT idle timeout is ~15s; ping every 10s
 COMMIT_TIMEOUT_S = 5.0      # max wait for committed_transcript after commit sent
                             # (bench: ElevenLabs RT finalises in 248-870ms healthy;
                             #  5s catches real hangs without false-positive fallback)
+# transcribe_burst pacing. ElevenLabs Realtime has a bounded server-side input
+# queue; dumping a long pre-recorded buffer in a tight loop overflows it
+# (queue_overflow close — observed in failed_log.txt on multi-minute audio).
+# Pace the burst to at most this multiple of real-time so the server's queue
+# can't run away. 4× finishes a 30s clip in ~7.5s while staying well under the
+# overflow point. (Long buffers are routed to Groq upstream and never reach
+# this path — see transcription.transcribe.)
+BURST_PACE_FACTOR = 4.0
 
 
 def _build_url(keyterms: List[str]) -> str:
@@ -67,6 +75,10 @@ def _build_url(keyterms: List[str]) -> str:
         # potentially-helpful effect on heavier-disfluency inputs we haven't
         # tested. Cost is zero.
         ("no_verbatim", "true"),
+        # Pin to English so Hindi loanwords come back Romanized instead of in
+        # Devanagari. Local devanagari_translit is the belt-and-suspenders
+        # safety net for any Devanagari that slips through the language pin.
+        ("language_code", "eng"),
     ]
     for term in keyterms:
         term = term.strip()
@@ -440,11 +452,19 @@ def transcribe_burst(pcm_bytes: bytes, api_key: str, keyterms: List[str], timeou
     chunk_size = SAMPLE_RATE * 2 // 10  # 100ms of PCM16 mono
     offset = 0
     total = len(pcm_bytes)
+    # Pace to BURST_PACE_FACTOR × real-time so we never outrun the server's
+    # input queue (a tight unpaced loop overflows it → queue_overflow).
+    t_burst = time.monotonic()
+    sent_audio_s = 0.0
     while offset < total:
         end = min(offset + chunk_size, total)
         chunk = pcm_bytes[offset:end]
         offset = end
         session.send_audio_chunk(chunk, commit=False)
+        sent_audio_s += (len(chunk) / 2) / SAMPLE_RATE
+        behind = (sent_audio_s / BURST_PACE_FACTOR) - (time.monotonic() - t_burst)
+        if behind > 0:
+            time.sleep(behind)
 
     session.commit(on_result)
 

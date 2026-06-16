@@ -79,20 +79,24 @@ def apply(raw_from_stt: str, toggles: Toggles | None = None) -> Result:
     if toggles.proper_nouns:
         s = proper_noun_fixes.apply(s)
 
-    # Step 2: spoken punctuation — reuses the existing PC-side normalizer.
+    # Step 2: spoken punctuation — shared normalizer (dependency-light module).
     if toggles.spoken_punctuation:
-        from transcription import _normalize_spoken_symbols
+        from .spoken_punctuation import normalize as _normalize_spoken_symbols
         s = _normalize_spoken_symbols(s)
 
         # Step 2.5: post-sentence-terminator voice formatting that the spoken-
-        # symbols pass misses. E.g. "First thought. new paragraph Second."
+        # symbols pass intentionally skips (its inline anchor needs a word char
+        # before the command, but ElevenLabs ends the prior sentence with a
+        # period first). Handles both mid-text ("First thought. New paragraph
+        # Second.") and end-of-utterance ("...done. New paragraph"), and absorbs
+        # any terminator ElevenLabs glues to the command word.
         s = re.sub(
-            r"([.!?])\s+new\s+paragraph\s+",
+            r"([.!?])\s+new\s+paragraph\b[.!?]*(\s+|$)",
             lambda m: m.group(1) + "[blank line]",
             s, flags=re.IGNORECASE,
         )
         s = re.sub(
-            r"([.!?])\s+new\s+line\s+",
+            r"([.!?])\s+new\s+line\b[.!?]*(\s+|$)",
             lambda m: m.group(1) + "[newline]",
             s, flags=re.IGNORECASE,
         )

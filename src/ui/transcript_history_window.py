@@ -341,6 +341,40 @@ class TranscriptHistoryModel(QAbstractListModel):
         return -1
 
 
+# --- Engine badge mapping -----------------------------------------------------
+
+def _engine_badge(engine):
+    """Map a PC engine label (the ENGINE: line in transcript_log.txt) to the
+    same friendly badge the mobile app shows: (label, foreground QColor,
+    background QColor). Returns None when there's no engine recorded (older
+    entries that pre-date ENGINE logging).
+
+    The mapping keys off what actually *produced* the text, so a fallback chain
+    like 'groq→gemini-fallback' shows as 'Gemini' and 'groq→local-whisper-
+    fallback' shows as 'On-device' — matching the phone, where GEMINI_AUDIO and
+    ANDROID_LOCAL get their own badges regardless of what was tried first."""
+    if not engine:
+        return None
+    e = engine.lower()
+
+    def _badge(label, hex_fg):
+        fg = QColor(hex_fg)
+        bg = QColor(hex_fg)
+        bg.setAlpha(38)  # ~15% tint over the card, mirrors mobile's 0x33 chips
+        return label, fg, bg
+
+    if 'gemini' in e:
+        return _badge('Gemini', '#4527A0')          # purple
+    if 'local' in e:                                  # local-whisper fallback
+        return _badge('On-device', '#455A64')        # grey
+    if e.startswith('elevenlabs'):
+        return _badge('ElevenLabs', '#0D47A1')       # blue
+    if e.startswith('groq'):
+        return _badge('Groq + Polish', '#00695C')    # teal
+    # Unknown / future engine: show the raw label in a neutral chip.
+    return _badge(engine, '#808080')
+
+
 # --- Delegate -----------------------------------------------------------------
 
 class TranscriptItemDelegate(QStyledItemDelegate):
@@ -361,8 +395,14 @@ class TranscriptItemDelegate(QStyledItemDelegate):
         self._ts_font = QFont('Segoe UI', 8)
         self._body_font = QFont('Segoe UI', 10)
         self._btn_font = QFont('Segoe UI', 9)
+        self._chip_font = QFont('Segoe UI', 8, QFont.Bold)
         self._ts_fm = QFontMetrics(self._ts_font)
         self._body_fm = QFontMetrics(self._body_font)
+        self._chip_fm = QFontMetrics(self._chip_font)
+
+    # Engine chip geometry (matches the mobile provider chip proportions).
+    CHIP_PAD_H = 8
+    CHIP_PAD_V = 2
 
     @classmethod
     def card_rect(cls, option_rect):
@@ -421,6 +461,25 @@ class TranscriptItemDelegate(QStyledItemDelegate):
         painter.setPen(QColor('#999'))
         ts_y = card.top() + self.MARGIN_V + self._ts_fm.ascent()
         painter.drawText(text_left, ts_y, timestamp)
+
+        # Engine badge (ok rows only) — top-right of the card, on the timestamp
+        # row. Names which STT engine/channel produced this entry, matching the
+        # mobile history chips. Failed rows reserve the right side for Retry.
+        if kind == 'ok':
+            badge = _engine_badge(index.data(EngineRole) or '')
+            if badge is not None:
+                label, fg, bg = badge
+                chip_w = self._chip_fm.horizontalAdvance(label) + 2 * self.CHIP_PAD_H
+                chip_h = self._chip_fm.height() + 2 * self.CHIP_PAD_V
+                chip_left = card.right() - self.MARGIN_H - chip_w
+                chip_top = card.top() + self.MARGIN_V + (self._ts_fm.height() - chip_h) // 2
+                chip = QRect(chip_left, chip_top, chip_w, chip_h)
+                painter.setBrush(bg)
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(chip, chip_h // 2, chip_h // 2)
+                painter.setFont(self._chip_font)
+                painter.setPen(fg)
+                painter.drawText(chip, Qt.AlignCenter, label)
 
         painter.setFont(self._body_font)
         painter.setPen(body_color)

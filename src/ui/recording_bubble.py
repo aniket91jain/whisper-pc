@@ -16,8 +16,9 @@ This replaces the old StatusWindow position so the user sees the same anchor
 they already learned.
 
 Interactions (per memory spec project_whisper_pc_three_state_bubble.md):
-  - Single click  → pauseToggleRequested  (RECORDING ↔ PAUSED)
-  - Double click  → endRequested          (end + transcribe)
+  - Single click on main circle → pauseToggleRequested  (RECORDING ↔ PAUSED)
+  - Double click on main circle → endRequested          (end + transcribe)
+  - Click on × badge (top-right) → cancelRequested      (abort + discard)
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import math
 import os
 import sys
 
-from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, QRectF, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QGuiApplication, QPainter,
                           QPainterPath, QPen, QPixmap)
 from PyQt5.QtWidgets import QApplication, QWidget
@@ -38,6 +39,12 @@ _BUBBLE_DIAMETER = 64       # actual circle diameter, like mobile BTN_DP=52 scal
 _WINDOW_PADDING = 12        # transparent room for shadow + transcribing ring
 _BOTTOM_OFFSET = 120        # px above the screen bottom edge (matches StatusWindow)
 _DOUBLE_CLICK_MS = 260
+
+# Cancel × badge — small dark circle at the top-right of the bubble. Visible in
+# every non-idle state. Drawn last so it overlays the transcribing ring at the
+# point of intersection. Click on the badge → cancelRequested.
+_CANCEL_BADGE_DIAMETER = 22
+_CANCEL_BADGE_INSET = 4     # how far the badge centre sits inside the circle edge
 
 # Pulse: mobile's startPulse runs 500ms 1.0→0.4, then 500ms 0.4→1.0, repeat.
 _PULSE_TICK_MS = 20                                 # ~50 fps
@@ -60,9 +67,12 @@ class RecordingBubble(QWidget):
     _COLOR_RING = QColor(0x1E, 0x88, 0xE5)                # transcribing spinner
     _COLOR_MIC = QColor(0x1C, 0x1C, 0x1E)                 # dark mic glyph
     _COLOR_SHADOW = QColor(0, 0, 0, 60)                   # drop shadow
+    _COLOR_CANCEL_BG = QColor(0x20, 0x20, 0x20, 0xEE)     # cancel × badge fill
+    _COLOR_CANCEL_FG = QColor(0xFF, 0xFF, 0xFF, 0xF0)     # cancel × glyph + ring
 
     pauseToggleRequested = pyqtSignal()
     endRequested = pyqtSignal()
+    cancelRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -101,6 +111,10 @@ class RecordingBubble(QWidget):
         self._click_timer.setInterval(_DOUBLE_CLICK_MS)
         self._click_timer.timeout.connect(self._fire_single_click)
         self._pending_single_click = False
+
+        # Cancel badge geometry — populated by paintEvent so mousePressEvent
+        # can hit-test it. Starts empty until first paint runs.
+        self._cancel_badge_rect = QRect()
 
         self._noactivate_applied = False
         self._position_bottom_center()
@@ -278,11 +292,53 @@ class RecordingBubble(QWidget):
             start = (90 - self._spinner_angle) * 16
             painter.drawArc(arc_rect, start, -90 * 16)
 
-    # ---- Click handling: single vs double ---------------------------------
+        # Cancel × badge at the top-right of the bubble. Drawn last so it
+        # always overlays the transcribing ring at the point of intersection
+        # — otherwise the rotating arc would visually slice through the badge.
+        badge_r = _CANCEL_BADGE_DIAMETER // 2
+        badge_cx = cx + r - _CANCEL_BADGE_INSET
+        badge_cy = cy - r + _CANCEL_BADGE_INSET
+        self._cancel_badge_rect = QRect(
+            badge_cx - badge_r, badge_cy - badge_r,
+            badge_r * 2, badge_r * 2,
+        )
+        # Solid dark disc behind the ×.
+        painter.setBrush(self._COLOR_CANCEL_BG)
+        painter.setPen(QPen(self._COLOR_CANCEL_FG, 1.0))
+        painter.drawEllipse(QRectF(self._cancel_badge_rect))
+        # × glyph — two diagonals, RoundCap so the strokes don't look chiselled.
+        glyph_pen = QPen(self._COLOR_CANCEL_FG, 2.0)
+        glyph_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(glyph_pen)
+        arm = badge_r * 0.45
+        painter.drawLine(
+            int(badge_cx - arm), int(badge_cy - arm),
+            int(badge_cx + arm), int(badge_cy + arm),
+        )
+        painter.drawLine(
+            int(badge_cx - arm), int(badge_cy + arm),
+            int(badge_cx + arm), int(badge_cy - arm),
+        )
+
+    # ---- Click handling: cancel vs single vs double -----------------------
 
     def mousePressEvent(self, event):  # noqa: D401
         if event.button() != Qt.LeftButton:
             return
+        # Cancel × badge wins over pause/end. Hit-test against the badge rect
+        # populated by the last paintEvent. Generous tolerance (the badge is
+        # small) — anything within 4 px of the rect counts.
+        pos = event.pos()
+        if not self._cancel_badge_rect.isNull():
+            hit_rect = self._cancel_badge_rect.adjusted(-4, -4, 4, 4)
+            if hit_rect.contains(pos):
+                # If a single-click was pending, cancel it — the user clearly
+                # meant cancel, not pause.
+                self._click_timer.stop()
+                self._pending_single_click = False
+                self.cancelRequested.emit()
+                event.accept()
+                return
         if self._click_timer.isActive():
             self._click_timer.stop()
             self._pending_single_click = False

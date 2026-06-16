@@ -14,6 +14,7 @@ from ui.settings_window import SettingsWindow
 from ui.status_window import StatusWindow
 from ui.transcript_history_window import TranscriptHistoryWindow
 from ui.recording_bubble import RecordingBubble
+from ui.engine_toast import EngineToast
 from transcription import create_local_model, prewarm_groq_connection
 from input_simulation import InputSimulator
 from notifications import register_dict_addition_listener
@@ -226,6 +227,12 @@ class WhisperPCApp(QObject):
         self.recording_bubble = RecordingBubble()
         self.recording_bubble.pauseToggleRequested.connect(self._on_bubble_pause_toggle)
         self.recording_bubble.endRequested.connect(self._on_bubble_end_requested)
+        self.recording_bubble.cancelRequested.connect(self._on_bubble_cancel_requested)
+        # Brief "transcribed by X" hint, floated just above the bubble at paste
+        # time. Anchored to the bubble's geometry constants so the two stay
+        # aligned if the bubble ever moves.
+        from ui.recording_bubble import _BUBBLE_DIAMETER, _BOTTOM_OFFSET
+        self.engine_toast = EngineToast(_BUBBLE_DIAMETER, _BOTTOM_OFFSET)
         # Thread-safe state-change channel. Any thread (pynput hook in
         # on_activation, audio thread via statusSignal, GUI thread itself)
         # can fire requested.emit(state) — the QueuedConnection guarantees
@@ -477,6 +484,7 @@ class WhisperPCApp(QObject):
             self.status_window.closeSignal.connect(self.stop_result_thread)
         self.result_thread.statusSignal.connect(self._on_recording_status)
         self.result_thread.resultSignal.connect(self.on_transcription_complete)
+        self.result_thread.engineSignal.connect(self._on_engine_known)
         self.result_thread.failedSignal.connect(self.on_transcription_failed)
         # WarmupCoordinator must not race ResultThread for the audio device.
         # If the idle timer or a lock event fires mid-recording, the coordinator
@@ -542,6 +550,41 @@ class WhisperPCApp(QObject):
         if self.result_thread and self.result_thread.isRunning():
             self.result_thread.stop_recording()
 
+    def _on_bubble_cancel_requested(self):
+        """× badge on the bubble — discard the in-flight recording or
+        transcription, hide the bubble immediately, re-arm the hotkey.
+
+        The worker thread is allowed to wind down on its own (a stuck Groq
+        upload can't be interrupted from outside the openai SDK). We disconnect
+        its result/failed signals first so any late emit is a no-op, then call
+        the non-blocking ResultThread.cancel() which closes any open ElevenLabs
+        WS and sets the cancel flag. The bubble hides immediately so the user
+        gets snappy visual feedback even when the worker is wedged.
+
+        Continuous mode is intentionally NOT re-armed here — cancel means the
+        user wants out, not "start another recording immediately".
+        """
+        if self.result_thread and self.result_thread.isRunning():
+            # Drop the result/failed wiring so anything the thread emits from
+            # here on is dropped on the floor. The thread itself will finish
+            # naturally; warmup_coordinator.resume_after_recording is left
+            # connected to result_thread.finished so warm-mic state recovers.
+            try:
+                self.result_thread.resultSignal.disconnect(self.on_transcription_complete)
+            except Exception:
+                pass
+            try:
+                self.result_thread.failedSignal.disconnect(self.on_transcription_failed)
+            except Exception:
+                pass
+            self.result_thread.cancel()
+        if hasattr(self, 'recording_bubble') and self.recording_bubble is not None:
+            self.recording_bubble.set_state('idle')
+        # Re-arm the keypress so the user can start a fresh dictation. Same
+        # call the press-to-toggle / hold-to-record paths make at end of run.
+        if self.key_listener:
+            self.key_listener.start()
+
     def stop_result_thread(self):
         """
         Stop the result thread.
@@ -555,6 +598,16 @@ class WhisperPCApp(QObject):
         ConfigManager.console_print(f'Transcription failed; audio saved to {audio_path} ({reason})')
         if self._history_window is not None and self._history_window.isVisible():
             self._history_window.refresh()
+
+    def _on_engine_known(self, engine):
+        """Flash the brief 'transcribed by X' hint above the bubble. Fired just
+        before the result lands. Best-effort — a toast failure must never break
+        the paste."""
+        try:
+            if getattr(self, 'engine_toast', None) is not None:
+                self.engine_toast.show_engine(engine)
+        except Exception:
+            pass
 
     def on_transcription_complete(self, result):
         """

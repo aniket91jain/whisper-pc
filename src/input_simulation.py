@@ -227,6 +227,17 @@ class InputSimulator:
         """
         if class_name in self._NATIVE_TEXT_CLASSES:
             return self._text_before_cursor_native(focus_hwnd, max_chars)
+        # Office document bodies (Word/Excel/PowerPoint) must NEVER be probed
+        # with simulated keystrokes. The probe sends Shift+Left/Ctrl+C/Right,
+        # and Office maps those (especially with the activation chord's Alt
+        # still virtually down — see _send_ctrl_v) onto editing commands and
+        # AutoCorrect symbol insertions, which drop a stray character ('.', '-')
+        # into the live document. Bug report 2026-06-16: "in Word the output is
+        # just a dot or a dash." Returning None skips the smart leading-space /
+        # lowercase / period-strip adjustments here and pastes the transcript
+        # verbatim — a minor cosmetic loss, never a corrupted document.
+        if class_name in self._OFFICE_BODY_CLASSES:
+            return None
         return self._text_before_cursor_probe()
 
     @staticmethod
@@ -297,6 +308,12 @@ class InputSimulator:
             self.keyboard.press(Key.right)
             self.keyboard.release(Key.right)
 
+            try:
+                from dict_diag import dd
+                dd('probe.result', probe if probe != sentinel else '<sentinel>',
+                   probe_len=len(probe))
+            except Exception:
+                pass
             if probe == sentinel:
                 # Clipboard untouched - nothing was selected (cursor at start).
                 return ''

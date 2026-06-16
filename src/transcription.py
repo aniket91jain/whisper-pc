@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import threading
 import time
 from typing import Optional, Tuple
 import numpy as np
@@ -12,6 +13,7 @@ from engine.polish.post_llm_repair import apply as apply_post_llm_repair
 from engine.polish.proper_nouns_renderer import substitute as substitute_proper_nouns
 from engine.net import blocked_cache
 from engine.stt import gemini_stt
+from engine.polish.spoken_punctuation import normalize as _normalize_spoken_symbols
 from notifications import fire_dict_addition
 
 
@@ -20,6 +22,31 @@ from notifications import fire_dict_addition
 # the TLS connection and skips the handshake (~200-400ms) on every polish
 # or transcribe call after the first.
 _OPENAI_CLIENTS: dict = {}
+
+# Max audio length (seconds) the ElevenLabs record-then-burst fallback will
+# handle. Longer audio is routed to Groq's file endpoint instead, because
+# bursting a long buffer into the Realtime streaming socket overflows its
+# server-side queue (queue_overflow). The live streaming path is unaffected.
+# Tunable: lower this (and/or BURST_PACE_FACTOR in elevenlabs_rt.py) if
+# queue_overflow ever recurs on shorter audio; raise it if Groq rerouting of
+# medium clips proves unnecessary.
+ELEVENLABS_BURST_MAX_S = 45.0
+
+
+# Thread-local record of the engine that produced the most recent transcript
+# on THIS thread. Set by _write_log_entry (the single chokepoint every ok path
+# funnels through) and consumed by result_thread right after transcribe()
+# returns, so the live "transcribed by X" toast knows which backend ran without
+# threading the label back through every transcribe() return signature.
+_LAST_ENGINE = threading.local()
+
+
+def consume_last_engine() -> str:
+    """Return the engine label recorded on this thread by the last successful
+    transcription, then clear it. Empty string if none recorded."""
+    value = getattr(_LAST_ENGINE, 'value', '') or ''
+    _LAST_ENGINE.value = ''
+    return value
 
 
 def _write_log_entry(raw: str, polished: str, engine: str) -> None:
@@ -32,6 +59,9 @@ def _write_log_entry(raw: str, polished: str, engine: str) -> None:
     `elevenlabs-burst`. Failures fail silently — logging is informational,
     not load-bearing.
     """
+    # Record for the live toast before touching the file — even if the log
+    # write fails, the toast should still name the engine that just ran.
+    _LAST_ENGINE.value = engine
     try:
         import datetime
         log_path = os.path.join(
@@ -153,144 +183,11 @@ _NON_ENGLISH_SCRIPT_RE = re.compile(
 )
 
 
-# Spoken-punctuation dictation table. Each tuple is
-#   (phrase_regex, symbol, side, safe_inline)
-#
-# `side` controls inline-replacement spacing:
-#   'L' = opening punctuation ([({") — keep leading whitespace, drop trailing
-#   'R' = closing/sentence-ending punctuation (.,;:!?]}) — drop leading, keep trailing
-#   'B' = bidirectional inline glyph (/ \ @ # = * - ...) — drop both spaces
-#
-# `safe_inline` gates the inline + end-of-utterance patterns. False means the
-# spoken word is too often legitimate content (e.g. "period of rest") to risk
-# replacing in those positions; the LLM SYMBOLS rule handles those cases.
-# The Whisper double-render pattern (symbol on both sides of the word) fires
-# regardless — it's near-zero false-positive because Whisper would never
-# spontaneously produce ". period." or ", colon," around legitimate content.
-#
-# Order matters: longer/more-specific phrases first so "exclamation mark"
-# wins over a hypothetical "exclamation", and "open parenthesis" wins over
-# "open paren".
-_SPOKEN_PUNCT = [
-    (r"new\s+paragraph",                            "[blank line]", "B", True),
-    (r"new\s+line",                                 "[newline]",    "B", True),
-    (r"exclamation\s+(?:mark|point)",               "!",            "R", True),
-    (r"question\s+mark",                            "?",            "R", True),
-    (r"open\s+parenthesis|open\s+paren",            "(",            "L", True),
-    (r"close\s+parenthesis|close\s+paren",          ")",            "R", True),
-    (r"open\s+bracket",                             "[",            "L", True),
-    (r"close\s+bracket",                            "]",            "R", True),
-    (r"open\s+curly(?:\s+brace)?|open\s+brace",     "{",            "L", True),
-    (r"close\s+curly(?:\s+brace)?|close\s+brace",   "}",            "R", True),
-    (r"end\s+quote",                                '"',            "R", True),
-    (r"semi[\s-]?colon",                            ";",            "R", True),
-    (r"forward\s+slash",                            "/",            "B", True),
-    (r"back[\s-]?slash",                            "\\",           "B", True),
-    (r"at\s+(?:sign|symbol)",                       "@",            "B", True),
-    (r"hash\s+(?:sign|tag)|hashtag",                "#",            "B", True),
-    (r"equals\s+sign",                              "=",            "B", True),
-    (r"ellipsis",                                   "...",          "R", True),
-    (r"asterisk",                                   "*",            "B", True),
-    (r"hyphen",                                     "-",            "B", True),
-    (r"comma",                                      ",",            "R", True),
-    (r"full[\s-]?stop",                             ".",            "R", True),
-    # Risky inline matches — these spoken words are commonly legitimate content
-    # ("period of rest", "made a dash", "colon cancer"). Only fire on a Whisper
-    # double-render, which Whisper would never produce around real content.
-    (r"period",                                     ".",            "R", False),
-    (r"colon",                                      ":",            "R", False),
-    (r"dash",                                       "-",            "B", False),
-    (r"slash",                                      "/",            "B", False),
-    (r"hash",                                       "#",            "B", False),
-    (r"equals",                                     "=",            "B", False),
-    (r"quote",                                      '"',            "L", False),
-    (r"star",                                       "*",            "B", False),
-]
-
-
-def _normalize_spoken_symbols(text: str) -> str:
-    """Convert spoken punctuation commands to their symbols when surrounding
-    context indicates the word is a dictation command rather than content.
-
-    Three patterns fire for safe phrases:
-      1. Whisper double-render: ``<sym><phrase><sym>`` → ``<sym>``
-         (model inserted both the symbol and the spoken word around it).
-      2. Inline mid-sentence: ``<word> <phrase> <word>`` → ``<word><sym><word>``
-         (clear command position, between content words).
-      3. End-of-utterance: ``<word> <phrase>[. ! ?]?$`` → ``<word><sym>``
-         (final word, optionally followed by Whisper's auto terminator).
-
-    For risky phrases (period, colon, dash, etc. — commonly content words)
-    only pattern 1 fires; the LLM SYMBOLS rule cleans up the rest.
-
-    Patterns require word boundaries plus ``\\s+`` separators around the
-    phrase, so embedded usages ("uncommon", "full-stopping") are safe.
-    """
-    # Use callable replacements throughout: replacement strings interpret \1,
-    # \\, and similar backreferences, which collides with symbols like \ or
-    # tokens like [newline].
-    for phrase, sym, side, safe in _SPOKEN_PUNCT:
-        sym_esc = re.escape(sym)
-        phrase_grouped = f"(?:{phrase})"
-
-        # 1. Whisper double-render. Always safe — Whisper does not surround
-        #    legitimate content with redundant punctuation.
-        text = re.sub(
-            rf'{sym_esc}\s*\b{phrase_grouped}\b\s*{sym_esc}',
-            lambda m, s=sym: s,
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        if not safe:
-            continue
-
-        if side == "L":
-            # Inline: keep leading space, drop trailing: "x open paren y" → "x (y"
-            text = re.sub(
-                rf'(?<=\w)(\s+)\b{phrase_grouped}\b\s+(?=\w)',
-                lambda m, s=sym: m.group(1) + s,
-                text,
-                flags=re.IGNORECASE,
-            )
-            # Start-of-utterance: "open bracket 5 ..." → "[5 ..."
-            text = re.sub(
-                rf'^\s*\b{phrase_grouped}\b\s+(?=\w)',
-                lambda m, s=sym: s,
-                text,
-                flags=re.IGNORECASE,
-            )
-        elif side == "R":
-            # Drop leading space, keep trailing space: "x comma y" → "x, y"
-            text = re.sub(
-                rf'(?<=\w)\s+\b{phrase_grouped}\b(?=\s+\w)',
-                lambda m, s=sym: s,
-                text,
-                flags=re.IGNORECASE,
-            )
-            # End-of-utterance, optional Whisper-inserted terminator absorbed.
-            text = re.sub(
-                rf'(?<=\w)\s+\b{phrase_grouped}\b\s*[.!?]?\s*$',
-                lambda m, s=sym: s,
-                text,
-                flags=re.IGNORECASE,
-            )
-        else:  # 'B'
-            # Drop both spaces: "x hash y" → "x#y"
-            text = re.sub(
-                rf'(?<=\w)\s+\b{phrase_grouped}\b\s+(?=\w)',
-                lambda m, s=sym: s,
-                text,
-                flags=re.IGNORECASE,
-            )
-            text = re.sub(
-                rf'(?<=\w)\s+\b{phrase_grouped}\b\s*$',
-                lambda m, s=sym: s,
-                text,
-                flags=re.IGNORECASE,
-            )
-
-    return text
+# Spoken-punctuation normalization moved to engine/polish/spoken_punctuation.py
+# (2026-06) so it can be unit-tested without importing this module's heavy
+# numpy/openai stack, and shared with the ElevenLabs RegexPolish path. The
+# `_normalize_spoken_symbols` name is re-exported (imported at the top of this
+# file) for the existing call site in post_process_transcription.
 
 
 # Matches two bare alphanumeric tokens separated by commas/hyphens (± spaces) or plain spaces.
@@ -824,6 +721,14 @@ def _finalize_elevenlabs_transcript(raw_text: str, api_key: str,
     history-delete sweep, and returns the polished final text.
     """
     from engine.polish import regex_polish
+    from engine.polish import devanagari_translit
+
+    # Devanagari → Latin transliteration safety net. ElevenLabs is pinned to
+    # language_code=eng which should romanize Hindi loanwords at the source;
+    # this pass catches any Devanagari that slips through (e.g. mid-sentence
+    # code-switch the language pin missed). No-op when the transcript has no
+    # Devanagari at all (the dominant case).
+    raw_text = devanagari_translit.transliterate(raw_text)
 
     polish_result = regex_polish.apply(raw_text, toggles=regex_polish.Toggles.from_config())
 
@@ -947,7 +852,21 @@ def transcribe(audio_data, local_model=None, force_groq: bool = False):
     # ElevenLabs *burst* on the same audio — same provider, same failure mode.
     stt_engine = ConfigManager.get_config_value('model_options', 'stt_engine') or 'groq'
     if not force_groq and stt_engine == 'elevenlabs':
-        return _transcribe_via_elevenlabs(audio_data)
+        # ElevenLabs Realtime is a streaming endpoint; bursting a long
+        # pre-recorded buffer floods its bounded server-side queue
+        # (queue_overflow — see failed_log.txt on multi-minute audio). The live
+        # streaming path (result_thread) is fine because it sends in real time,
+        # but this record-then-burst fallback must cap length and hand long
+        # audio to Groq's file endpoint (robust at any length) instead.
+        sample_rate = ConfigManager.get_config_value('recording_options', 'sample_rate') or 16000
+        duration = len(audio_data) / sample_rate
+        if duration <= ELEVENLABS_BURST_MAX_S:
+            return _transcribe_via_elevenlabs(audio_data)
+        ConfigManager.console_print(
+            f'Audio {duration:.0f}s exceeds ElevenLabs burst cap ({ELEVENLABS_BURST_MAX_S:.0f}s); '
+            f'using Groq to avoid queue_overflow'
+        )
+        # fall through to the Groq path below (local_model fallback preserved)
 
     # Skip STT only on a completely dead signal (muted mic, no input device).
     # Threshold is intentionally very low — only catches zero/near-zero input, not quiet speech.

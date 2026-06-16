@@ -148,7 +148,7 @@ recording_options:
     type: str
     description: "The keyboard shortcut to toggle the Transcript History popup (Ditto-style). Press once to open near the mouse cursor; press again to dismiss. Leave blank to disable."
   pause_key:
-    value: alt+shift+p
+    value: alt+d
     type: str
     description: "The keyboard shortcut to pause/resume an active recording. While recording, pressing this pauses (bubble turns stable green). Pressing it again resumes (bubble turns red and pulses). The activation shortcut still ends recording and transcribes regardless of pause state. Leave blank to disable."
   recording_mode:
