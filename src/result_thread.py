@@ -189,6 +189,12 @@ class ResultThread(QThread):
         # the failed log at the already-saved file instead of writing a 2nd copy.
         self._archive_abs = None
         self._archive_rel = None
+        # Tier 2 (2026-07-06): frames captured in the tiny window on resume
+        # before the fresh streaming session is assigned are buffered here and
+        # flushed into that session the instant it appears — so a resume never
+        # forces a Groq burst (ElevenLabs catches up at faster-than-real-time).
+        # Reset per-dictation in run().
+        self._resume_pending = []
         self.mutex = QMutex()
         # v0.3.2 PC: streaming-during-recording session. Open before recording
         # starts (when stt_engine=elevenlabs AND stt_streaming_mode=true), fed
@@ -395,6 +401,7 @@ class ResultThread(QThread):
             self._streaming_in_use = False
             self._pause_commit_thread = None
             self._stream_failed_reason = None
+            self._resume_pending = []
             self._acquire_warm_session_or_open()
 
             self.statusSignal.emit('recording')
@@ -723,24 +730,47 @@ class ResultThread(QThread):
             f'frames buffer until session_started'
         )
 
+    # Cap on how many frames we buffer across a resume gap before giving up and
+    # bursting. A fresh ElevenLabs session is normally assigned in well under a
+    # second; ~250 frames (~7.5s at 30ms) is a generous ceiling that still
+    # protects against a session that never opens.
+    _RESUME_STREAM_BUFFER_MAX_FRAMES = 250
+
     def _feed_streaming_session(self, pcm_frame: np.ndarray) -> None:
-        """Forward one captured PCM frame to the streaming session, if any."""
+        """Forward one captured PCM frame to the streaming session, if any.
+
+        Tier 2 (2026-07-06): a None session no longer condemns the whole
+        dictation to a Groq burst. Two cases are now handled gracefully:
+
+          * Pause-boundary straggler — a frame that was mid-flight in the
+            capture loop when pause() nulled the session. is_paused is already
+            True; the pre-pause span was already committed and the frame is
+            safe in `recording`. Harmless: drop it from the stream, do NOT fail.
+
+          * Resume gap — a frame captured just after resume, before the fresh
+            session is assigned. Buffer it (bounded) and flush the buffer into
+            the session the instant it appears, so we stay on ElevenLabs and it
+            catches up at faster-than-real-time. Only if the buffer overflows
+            (session never opened) do we fall back to a burst.
+        """
         session = self._stream_session
         if session is None:
-            # We were handed a (non-paused) frame but hold no live session.
-            # When this dictation is taking the streaming path, that frame is
-            # now missing from the stream — e.g. the brief resume window before
-            # the fresh session becomes live. The frame is safe in `recording`,
-            # but the streamed spans are no longer complete, so force the stop
-            # path to burst the full audio buffer rather than stitch partial
-            # spans (which would drop the start of the post-resume span).
+            if self.is_paused:
+                # Pause-boundary straggler — not a failure.
+                if self._diag is not None:
+                    self._diag.mark('pause_straggler_ignored')
+                return
             if self._streaming_in_use and self._stream_failed_reason is None:
-                self._stream_failed_reason = (
-                    'capture outran live stream (resume gap); bursting full audio'
-                )
-                ConfigManager.console_print(
-                    'Frame captured with no live stream; will burst full audio on stop'
-                )
+                if len(self._resume_pending) < self._RESUME_STREAM_BUFFER_MAX_FRAMES:
+                    self._resume_pending.append(pcm_frame)
+                else:
+                    self._stream_failed_reason = (
+                        'resume session did not open in time; bursting full audio'
+                    )
+                    self._resume_pending = []
+                    ConfigManager.console_print(
+                        'Resume session never opened; will burst full audio on stop'
+                    )
             return
         if session.is_dead():
             # The socket has actually closed/failed (server reject, network
@@ -755,6 +785,18 @@ class ResultThread(QThread):
             self._stream_session = None
             return
         try:
+            # Flush any frames buffered during a resume gap first, in order, so
+            # the fresh session hears the post-resume audio from its true start.
+            # The session buffers them in _pending until session_started, then
+            # streams them faster-than-real-time to catch up.
+            if self._resume_pending:
+                pending = self._resume_pending
+                self._resume_pending = []
+                ConfigManager.console_print(
+                    f'Flushing {len(pending)} buffered resume-gap frame(s) into fresh session'
+                )
+                for f in pending:
+                    session.send_audio_chunk(f.tobytes(), commit=False)
             session.send_audio_chunk(pcm_frame.tobytes(), commit=False)
         except Exception as e:
             ConfigManager.console_print(f'Streaming send failed: {e}; switching to burst-on-stop')
