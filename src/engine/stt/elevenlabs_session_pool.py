@@ -155,6 +155,26 @@ class ElevenLabsSessionPool:
         self._kick_replenish()
         return None
 
+    def try_acquire_nowait(self):
+        """Return the warm Session only if one is instantly ready; never blocks.
+
+        Unlike acquire(), this does NOT join an in-flight open — it returns None
+        immediately when no session is warm. Used on the dictation resume path,
+        which runs while recording is paused: any blocking there would drop
+        post-resume audio, so the caller instead opens a fresh (buffering)
+        session inline when this returns None. Kicks a background replenish so a
+        warm session is ready for next time.
+        """
+        if self._stopped or not self._enabled:
+            return None
+        session = self._take_warm_session()
+        if session is not None:
+            ConfigManager.console_print(
+                'ElevenLabsSessionPool: handed out warm session (nowait), replenishing'
+            )
+        self._kick_replenish()
+        return session
+
     # ---- internals ----
 
     def _take_warm_session(self):

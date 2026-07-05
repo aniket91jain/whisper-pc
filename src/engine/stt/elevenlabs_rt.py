@@ -254,6 +254,14 @@ class Session:
     def is_ready(self) -> bool:
         return self._ready.is_set() and not self._closed.is_set()
 
+    def is_dead(self) -> bool:
+        """True once the WS has actually closed/failed. Distinct from "not yet
+        ready": a still-connecting session is neither ready nor dead — it buffers
+        frames in _pending and flushes them on session_started. Callers feeding a
+        live recording use this to tell a doomed socket (fall back to burst) from
+        one that just hasn't finished its handshake (keep feeding; it buffers)."""
+        return self._closed.is_set()
+
     def session_id(self) -> Optional[str]:
         return self._session_id
 
