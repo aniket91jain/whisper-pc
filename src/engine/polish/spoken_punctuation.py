@@ -50,8 +50,14 @@ _SPOKEN_PUNCT = [
     (r"question\s+mark",                            "?",            "R", True),
     (r"open\s+parenthesis|open\s+paren",            "(",            "L", True),
     (r"close\s+parenthesis|close\s+paren",          ")",            "R", True),
-    (r"open\s+bracket",                             "[",            "L", True),
-    (r"close\s+bracket",                            "]",            "R", True),
+    # "bracket" defaults to ROUND brackets per user pref (2026-07-05): saying
+    # "bracket" gives ( ); square brackets require the explicit word "square".
+    # Square variants MUST precede the bare "bracket" rules so they win the
+    # longest-match race.
+    (r"open\s+square\s+bracket",                    "[",            "L", True),
+    (r"close\s+square\s+bracket",                   "]",            "R", True),
+    (r"open\s+bracket",                             "(",            "L", True),
+    (r"close\s+bracket",                            ")",            "R", True),
     (r"open\s+curly(?:\s+brace)?|open\s+brace",     "{",            "L", True),
     (r"close\s+curly(?:\s+brace)?|close\s+brace",   "}",            "R", True),
     # "unquote" / "close quote" are synonyms of "end quote" for a lone closing
@@ -75,7 +81,11 @@ _SPOKEN_PUNCT = [
     (r"period",                                     ".",            "R", False),
     (r"colon",                                      ":",            "R", False),
     (r"dash",                                       "-",            "B", False),
-    (r"slash",                                      "/",            "B", False),
+    # Plain "slash" -> / always, per user pref (2026-07-05): the user treats
+    # "slash" as the character, not the verb. safe=True so it fires inline.
+    # Positioned AFTER "back slash" above so "back slash" -> \ still wins.
+    # Accepted trade-off: "slash" used as a verb ("slash costs") also becomes "/".
+    (r"slash",                                      "/",            "B", True),
     (r"hash",                                       "#",            "B", False),
     (r"equals",                                     "=",            "B", False),
     (r"quote",                                      '"',            "L", False),

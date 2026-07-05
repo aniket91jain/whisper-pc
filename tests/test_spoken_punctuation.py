@@ -22,10 +22,16 @@ CASES = [
     ("Quote hello world unquote", '"hello world"'),
     ("Quote, hello world, unquote.", '"hello world".'),
     ("open quote keep it simple close quote", '"keep it simple"'),
-    ("Open bracket five close bracket", "[five]"),
-    ("Open bracket five, close bracket.", "[five]"),
+    # "bracket" defaults to ROUND brackets (user pref 2026-07-05); square
+    # brackets need the explicit word "square".
+    ("Open bracket five close bracket", "(five)"),
+    ("Open bracket five, close bracket.", "(five)"),
     ("close the door open bracket gently close bracket now",
-     "close the door [gently] now"),
+     "close the door (gently) now"),
+    ("open square bracket five close square bracket", "[five]"),
+    # plain "slash" -> / (user pref 2026-07-05)
+    ("the file is a slash b", "the file is a/b"),
+    ("the path is foo slash bar slash baz", "the path is foo/bar/baz"),
     ("first thought new paragraph second thought",
      "first thought[blank line]second thought"),
 
@@ -38,7 +44,7 @@ CASES = [
      "question one[newline]question two"),
 
     # --- start / end of utterance ---
-    ("open bracket alpha close bracket", "[alpha]"),
+    ("open bracket alpha close bracket", "(alpha)"),
     ("say hello comma", "say hello,"),
 
     # --- risky words must NOT fire as content ---
