@@ -17,6 +17,54 @@ from transcription import transcribe, transcribe_streaming_result, Transcription
 from utils import ConfigManager
 
 
+def prune_recordings_archive(project_root, retention_days=7, max_files=2000):
+    """Trim the save-first recordings/ archive at startup.
+
+    Deletes .wav files older than `retention_days`, then trims what remains to
+    the newest `max_files`. This is the ONE place we hard-delete audio: the
+    archive is a self-cleaning safety cache, so aged files are meant to expire.
+    Safe no-op if the folder doesn't exist. Never touches failed/ or any log."""
+    rec_dir = os.path.join(project_root, 'recordings')
+    if not os.path.isdir(rec_dir):
+        return
+    cutoff = time.time() - retention_days * 86400
+    survivors = []
+    removed = 0
+    try:
+        entries = list(os.scandir(rec_dir))
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.lower().endswith('.wav'):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            try:
+                os.remove(entry.path)
+                removed += 1
+            except OSError:
+                pass
+        else:
+            survivors.append((mtime, entry.path))
+    # Count cap: keep the newest max_files, delete the rest.
+    if len(survivors) > max_files:
+        survivors.sort(reverse=True)  # newest first
+        for _mtime, path in survivors[max_files:]:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        ConfigManager.console_print(
+            f'Pruned {removed} old recording(s) from the archive '
+            f'(kept files ≤{retention_days} days old, newest {max_files}).'
+        )
+
+
 # Phase-timing diagnostics file. pythonw.exe has no console, so console_print()
 # output goes to the void — when a transcription hangs, there's no way to tell
 # which phase wedged. This sink writes one short line per phase boundary to a
@@ -135,6 +183,12 @@ class ResultThread(QThread):
         # stuck network call would freeze the GUI).
         self.is_cancelled = False
         self.sample_rate = None
+        # Save-first archive: every finished recording is written to recordings/
+        # BEFORE transcription (see _archive_recording). These hold the abs/rel
+        # path of the current recording so _persist_failed_recording can point
+        # the failed log at the already-saved file instead of writing a 2nd copy.
+        self._archive_abs = None
+        self._archive_rel = None
         self.mutex = QMutex()
         # v0.3.2 PC: streaming-during-recording session. Open before recording
         # starts (when stt_engine=elevenlabs AND stt_streaming_mode=true), fed
@@ -193,32 +247,34 @@ class ResultThread(QThread):
     def resume_recording(self):
         """Resume capture after a pause.
 
-        v0.4.1 (data-loss fix): clear is_paused FIRST, *before* reopening the
-        streaming session. The capture loop gates every appended frame on
-        is_paused, so post-resume speech must reach the `recording` buffer the
-        instant the user resumes. The old order reopened the session first and
-        only cleared is_paused afterwards — so the entire reopen window (a warm-
-        pool handoff, up to ~2s on the blocking fallback open, or *forever* if
-        the reopen raised) was still treated as paused and silently discarded.
-        That was the "everything after the pause is missed" bug: the pre-pause
-        span committed fine, the post-resume audio never entered the buffer, and
-        stop reported success (delivered=True, no error) with only the early
-        spans. Mirrors mobile, which already sets state=RECORDING before reopen.
+        v0.4.4: reopen the streaming session BEFORE clearing is_paused, so
+        _stream_session is already assigned by the time the capture loop resumes
+        feeding frames. This closes the "resume gap" that forced a Groq burst on
+        almost every pause: previously is_paused was cleared first (v0.4.1), so
+        every frame captured during the new connection's handshake (up to ~1.5s)
+        found _stream_session = None and tripped _feed_streaming_session's
+        "no live stream" path, marking the whole dictation for a full Groq burst.
 
-        Reopen is now best-effort and guarded: any frame captured before the
-        fresh session is live is still in `recording`, and _feed_streaming_session
-        marks the stream incomplete so stop bursts the full buffer. Words can no
-        longer be lost regardless of how the reopen goes.
+        The reopen is now NON-BLOCKING — _reopen_streaming_session_on_resume
+        assigns a session that buffers frames internally until its WS handshake
+        completes (Session._pending), and only takes a pool session if one is
+        instantly ready (no join). So doing it while still paused costs <1ms and
+        drops no audio (the capture loop discards frames while paused anyway).
+
+        This does NOT reintroduce the v0.4.1 data-loss bug (where a *blocking*
+        reopen-first stalled capture and dropped post-resume audio): is_paused is
+        cleared unconditionally right after the reopen — even if it raised — so
+        capture always resumes into `recording` (lossless), and the reopen no
+        longer blocks. If the reopen genuinely fails, _stream_failed_reason makes
+        stop burst the full buffer, which still holds every post-resume frame.
         """
         self.mutex.lock()
         if not (self.is_recording and self.is_paused):
             self.mutex.unlock()
             return
-        self.is_paused = False
         self.mutex.unlock()
-        if self._diag is not None:
-            self._diag.mark('resume')
-        self.statusSignal.emit('recording')
+        # Reopen while still paused (non-blocking) so the session is live-or-
+        # connecting before capture feeds it — no frame ever sees a None session.
         try:
             self._reopen_streaming_session_on_resume()
         except Exception as e:
@@ -229,6 +285,13 @@ class ResultThread(QThread):
             self._stream_failed_reason = (
                 self._stream_failed_reason or f'resume reopen error: {e}'
             )
+        # Clear is_paused LAST and unconditionally so capture always resumes.
+        self.mutex.lock()
+        self.is_paused = False
+        self.mutex.unlock()
+        if self._diag is not None:
+            self._diag.mark('resume')
+        self.statusSignal.emit('recording')
 
     def toggle_pause(self):
         """Single-shortcut helper: pause if recording, resume if paused."""
@@ -360,6 +423,14 @@ class ResultThread(QThread):
                 self.statusSignal.emit('idle')
                 return
 
+            # Save-first: persist the raw recording to the rolling archive
+            # BEFORE any transcription is attempted. This is the safety net that
+            # makes EVERY downstream failure (empty result, network drop, queue
+            # overflow, resume-gap burst, even an app crash) recoverable — the
+            # audio is on disk before anything can go wrong. Pruned by age/count
+            # at startup (prune_recordings_archive).
+            self._archive_abs, self._archive_rel = self._archive_recording(audio_data)
+
             self.statusSignal.emit('transcribing')
             ConfigManager.console_print('Transcribing...')
             diag.mark('transcribe_start')
@@ -376,6 +447,7 @@ class ResultThread(QThread):
                 diag.mark('cancelled', stage='post_stream_commit')
                 return
 
+            recovery_burst = False
             if streaming_text is not None:
                 # ElevenLabs streaming delivered text; just polish.
                 diag.mark('polish_streaming_start')
@@ -388,6 +460,12 @@ class ResultThread(QThread):
                 # (Mirrors mobile v0.3.4 forceGroq path.)
                 streaming_failed = self._stream_failed_reason is not None
                 self._stream_failed_reason = None
+                # A "recovery burst" is a burst forced *because the live stream
+                # already failed* (e.g. the post-pause resume-gap safety net).
+                # We know speech was being captured, so an empty result here is
+                # a recovery FAILURE, not genuine silence — see the empty-result
+                # handling below, which saves it for Retry instead of discarding.
+                recovery_burst = streaming_failed
                 diag.mark('transcribe_burst_start', force_groq=streaming_failed)
                 result = transcribe(audio_data, self.local_model, force_groq=streaming_failed)
                 diag.mark('transcribe_burst_end',
@@ -406,8 +484,29 @@ class ResultThread(QThread):
                 return
 
             if not result.strip():
-                # Whisper produced nothing usable (silence, hallucination filter,
-                # RMS skip). Surface "Nothing transcribable detected" via the
+                # A recovery burst (live stream failed → forced Groq over the
+                # full buffer) coming back empty is NOT genuine silence: the
+                # stream had already been carrying real speech before it broke
+                # (e.g. a long unpaused pause + resume gap on a multi-minute
+                # dictation). Whisper/Groq can return empty or a filtered
+                # hallucination when a long silence dominates the buffer, and
+                # silently discarding it loses the whole dictation with no
+                # recovery. Treat it as a FAILURE so the audio is saved to
+                # failed/ and shows up with a Retry button in transcript history.
+                substantial = audio_data is not None and audio_data.size > 16000  # >~1s
+                if recovery_burst and substantial and not self.is_cancelled:
+                    reason = 'recovery burst returned empty (post-pause stream gap)'
+                    diag.mark('recovery_burst_empty', samples=int(audio_data.size))
+                    ConfigManager.console_print(
+                        'Recovery burst returned empty on a substantial recording; '
+                        'saving audio for Retry instead of discarding.'
+                    )
+                    self._persist_failed_recording(audio_data, reason)
+                    self.statusSignal.emit('error')
+                    self.resultSignal.emit('')
+                    return
+                # Genuine silence / hallucination filter / RMS skip on a normal
+                # dictation. Surface "Nothing transcribable detected" via the
                 # status overlay and skip the paste, but still emit an empty
                 # result so continuous-mode / key listener re-arming runs.
                 self.statusSignal.emit('no_speech')
@@ -464,36 +563,69 @@ class ResultThread(QThread):
             if consumer is not None and self._audio_capture_service is not None:
                 self._audio_capture_service.detach_consumer(consumer)
 
-    def _persist_failed_recording(self, audio_data, reason):
-        """Save audio to failed/<timestamp>.wav and append an entry to failed_log.txt."""
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        failed_dir = os.path.join(project_root, 'failed')
-        try:
-            os.makedirs(failed_dir, exist_ok=True)
-        except Exception as e:
-            ConfigManager.console_print(f'Could not create failed/ dir: {e}')
-            return
+    def _archive_recording(self, audio_data):
+        """Save every finished recording to recordings/ BEFORE transcription.
 
+        This is the save-first safety net: the raw audio lands on disk before
+        anything can fail, so no dictation is ever lost to a transcription
+        error, empty result, network drop, or crash. Returns (abs_path,
+        rel_path), or (None, None) if the write fails. Files are pruned by age
+        and count at startup — see prune_recordings_archive."""
+        if audio_data is None or getattr(audio_data, 'size', 0) <= 0:
+            return None, None
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        rec_dir = os.path.join(project_root, 'recordings')
+        try:
+            os.makedirs(rec_dir, exist_ok=True)
+            now = datetime.datetime.now()
+            fname = now.strftime('%Y-%m-%d_%H-%M-%S_%f') + '.wav'
+            abs_path = os.path.join(rec_dir, fname)
+            sf.write(abs_path, audio_data, self.sample_rate or 16000)
+            rel_path = os.path.relpath(abs_path, project_root).replace(os.sep, '/')
+            ConfigManager.console_print(f'Archived recording → {rel_path}')
+            return abs_path, rel_path
+        except Exception as e:
+            ConfigManager.console_print(f'Could not archive recording: {e}')
+            return None, None
+
+    def _persist_failed_recording(self, audio_data, reason):
+        """Record a failed transcription in failed_log.txt.
+
+        The raw audio is already on disk in recordings/ (save-first, see
+        _archive_recording), so normally we just append a log entry pointing at
+        that archived file — no second copy — and Retry reads it straight from
+        the archive. Only if the archive write failed do we fall back to a
+        dedicated failed/ copy here, so a failure is NEVER left with no audio."""
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         now = datetime.datetime.now()
         ts_human = now.strftime('%Y-%m-%d %H:%M:%S')
-        fname = now.strftime('%Y-%m-%d_%H-%M-%S_%f') + '.wav'
-        audio_path = os.path.join(failed_dir, fname)
 
-        try:
-            sf.write(audio_path, audio_data, self.sample_rate or 16000)
-        except Exception as e:
-            ConfigManager.console_print(f'Could not save failed audio: {e}')
-            return
+        rel_path = self._archive_rel
+        if not (rel_path and self._archive_abs and os.path.isfile(self._archive_abs)):
+            # Archive missing (write failed) — fall back to a failed/ copy so we
+            # still preserve the audio for Retry.
+            failed_dir = os.path.join(project_root, 'failed')
+            rel_path = None
+            try:
+                os.makedirs(failed_dir, exist_ok=True)
+                fname = now.strftime('%Y-%m-%d_%H-%M-%S_%f') + '.wav'
+                audio_path = os.path.join(failed_dir, fname)
+                sf.write(audio_path, audio_data, self.sample_rate or 16000)
+                rel_path = os.path.relpath(audio_path, project_root).replace(os.sep, '/')
+            except Exception as e:
+                ConfigManager.console_print(f'Could not save failed audio: {e}')
 
-        rel_path = os.path.relpath(audio_path, project_root).replace(os.sep, '/')
         log_path = os.path.join(project_root, 'failed_log.txt')
         try:
             with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(f'[{ts_human}]\n  AUDIO:    {rel_path}\n  ERROR:    {reason}\n\n')
+                audio_line = rel_path if rel_path else '(audio not saved)'
+                f.write(f'[{ts_human}]\n  AUDIO:    {audio_line}\n  ERROR:    {reason}\n\n')
         except Exception as e:
             ConfigManager.console_print(f'Could not write failed_log.txt: {e}')
 
-        self.failedSignal.emit(audio_path, reason)
+        if rel_path:
+            abs_out = os.path.join(project_root, rel_path.replace('/', os.sep))
+            self.failedSignal.emit(abs_out, reason)
 
     # ---- v0.3.2 PC: streaming-during-recording helpers ----
 
@@ -561,37 +693,35 @@ class ResultThread(QThread):
             ConfigManager.console_print(f'Streaming session prep failed: {e}; will use burst on stop')
             return
 
-        from threading import Event as _Event
-        ready_event = _Event()
-
         def on_ready(ok: bool) -> None:
-            if ok:
-                ready_event.set()
-            else:
-                # Mirrors mobile v0.3.6: session.onFailure fires onReadyCallback(false)
-                # for mid-recording deaths too. Mark a reason so the eventual
-                # stop path falls through to burst/Groq instead of trying to
-                # commit a dead session.
-                self._stream_failed_reason = 'ElevenLabs streaming session ended'
-                ready_event.set()  # unblock the caller
+            # Mirrors mobile v0.3.6: session.onFailure fires onReadyCallback(false)
+            # for failed opens and mid-recording deaths. Mark a reason so the
+            # stop path bursts the full audio instead of committing a dead
+            # session. A *successful* open needs no action here — the session is
+            # already assigned below and has been buffering frames until ready.
+            if not ok:
+                self._stream_failed_reason = (
+                    self._stream_failed_reason or 'ElevenLabs streaming session failed to open'
+                )
 
         session = Session(api_key, keyterms)
         session.start(on_ready=on_ready)
-        # Wait briefly for session_started. If it doesn't come, we still let
-        # the recording proceed — _record_audio will treat the session as dead
-        # and we'll fall back at stop time.
-        if not ready_event.wait(timeout=2.0):
-            ConfigManager.console_print('Streaming session not ready within 2s; falling back to burst on stop')
-            session.cancel()
-            return
-        if self._stream_failed_reason:
-            ConfigManager.console_print('Streaming session failed to open; falling back to burst on stop')
-            session.cancel()
-            return
-
+        # Assign the session IMMEDIATELY — do NOT block on the WS handshake.
+        # Session.send_audio_chunk() buffers any frames that arrive before
+        # session_started (Session._pending) and flushes them in order the
+        # instant the socket is ready, so streaming into a still-connecting
+        # session loses nothing. The old 2s ready-wait is exactly what left
+        # _stream_session = None during a resume reopen, so every frame captured
+        # in that window hit the "no live stream" path and forced a Groq burst.
+        # Assigning up-front keeps dictation on ElevenLabs straight through
+        # pause/resume; a genuine open failure is handled via on_ready(False)
+        # above (sets _stream_failed_reason → stop bursts the full buffer).
         self._stream_session = session
         self._streaming_in_use = True
-        ConfigManager.console_print(f'Streaming session opened (keyterms={len(keyterms)})')
+        ConfigManager.console_print(
+            f'Streaming session opening (keyterms={len(keyterms)}); '
+            f'frames buffer until session_started'
+        )
 
     def _feed_streaming_session(self, pcm_frame: np.ndarray) -> None:
         """Forward one captured PCM frame to the streaming session, if any."""
@@ -612,9 +742,13 @@ class ResultThread(QThread):
                     'Frame captured with no live stream; will burst full audio on stop'
                 )
             return
-        if not session.is_ready():
-            # Session died during recording — note the reason once and stop
-            # trying to feed it. Burst fallback will pick up at stop.
+        if session.is_dead():
+            # The socket has actually closed/failed (server reject, network
+            # drop, failed open). A still-CONNECTING session is NOT dead — it
+            # returns False from is_ready() but buffers frames until
+            # session_started, so we must not treat "not ready yet" as death or
+            # we'd bail to a Groq burst on every resume reopen. Only a truly
+            # closed socket forces the burst fallback.
             if not self._stream_failed_reason:
                 self._stream_failed_reason = 'ElevenLabs streaming session died mid-recording'
                 ConfigManager.console_print('Streaming session died mid-recording; switching to burst-on-stop')
@@ -710,15 +844,31 @@ class ResultThread(QThread):
         stop bursts the full audio — post-resume speech is still captured in the
         recording buffer, so nothing is lost.
 
+        MUST be non-blocking: it runs while is_paused is still True (the caller
+        clears is_paused immediately after) and the capture loop discards frames
+        while paused, so any blocking here would drop post-resume audio. So we
+        take a pool session ONLY if one is instantly ready (try_acquire_nowait,
+        no join), otherwise open a fresh session inline — which assigns up-front
+        and buffers frames until its handshake completes (see
+        _open_streaming_session_if_enabled). Either way capture streams straight
+        onto ElevenLabs across the pause instead of falling into the burst gap.
+
         v0.4.1: no longer joins the pause-commit here. That join only existed to
         keep span order, but stop's _commit_streaming_session already joins
-        before it reads _stream_segments, so ordering still holds — and joining
-        on the resume path needlessly blocked the GUI thread (up to the 8s commit
-        timeout) while the user had already resumed talking.
+        before it reads _stream_segments, so ordering still holds.
         """
         if not self._streaming_in_use:
             return
-        self._acquire_warm_session_or_open()
+        pool = self._session_pool
+        if pool is not None and pool.is_enabled():
+            warm = pool.try_acquire_nowait()
+            if warm is not None:
+                self._stream_session = warm
+                self._streaming_in_use = True
+                ConfigManager.console_print('Resume: took instantly-ready warm session from pool')
+                return
+        # No instant warm session — open a fresh one inline (non-blocking).
+        self._open_streaming_session_if_enabled()
         if self._stream_session is None and not self._stream_failed_reason:
             self._stream_failed_reason = 'could not reopen streaming session on resume'
             ConfigManager.console_print(

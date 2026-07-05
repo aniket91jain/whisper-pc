@@ -55,6 +55,11 @@ coverage.xml
 *.mo
 *.pot
 
+# Save-first audio archive — holds a rolling copy of EVERY dictation, so it
+# must never be committed (privacy: guest data, legal matters, etc.). Pruned
+# by age/count at startup. See ResultThread._archive_recording.
+recordings/
+
 # Django stuff:
 *.log
 local_settings.py

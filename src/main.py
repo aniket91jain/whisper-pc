@@ -201,6 +201,13 @@ class WhisperPCApp(QObject):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._log_path = os.path.join(project_root, 'transcript_log.txt')
         self._failed_log_path = os.path.join(project_root, 'failed_log.txt')
+        # Trim the save-first recordings/ archive at each startup so it never
+        # grows unbounded (see prune_recordings_archive / ResultThread._archive_recording).
+        try:
+            from result_thread import prune_recordings_archive
+            prune_recordings_archive(project_root)
+        except Exception as e:
+            ConfigManager.console_print(f'Recordings prune skipped: {e}')
         # Construct the history popup once, eagerly. Toggles after this point
         # are just show()/hide(), avoiding the lazy-init race that previously
         # let rapid hotkey/tray clicks create dozens of duplicate windows.

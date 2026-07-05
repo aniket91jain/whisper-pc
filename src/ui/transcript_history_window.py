@@ -206,7 +206,15 @@ class RetryWorker(QThread):
                 data = data[:, 0]
             audio = np.ascontiguousarray(data, dtype=np.int16)
             result = transcribe(audio, self.local_model)
-            self.successSignal.emit(self.audio_abs_path, result or '')
+            if result and result.strip():
+                self.successSignal.emit(self.audio_abs_path, result)
+            else:
+                # An empty retry is NOT a success — the recording still yielded
+                # no text. Report it as an error so the failed entry AND the
+                # audio are kept for another try, instead of being cleaned up.
+                # (Pre-2026-07-05 this emitted success on empty, and the success
+                # handler then hard-deleted the only copy of the audio.)
+                self.errorSignal.emit(self.audio_abs_path, 'Retry produced no text (still empty)')
         except TranscriptionAPIError as e:
             self.errorSignal.emit(self.audio_abs_path, e.reason)
         except Exception as e:
@@ -851,12 +859,12 @@ class TranscriptHistoryWindow(BaseWindow):
             except Exception as e:
                 ConfigManager.console_print(f'typewrite failed during retry: {e}')
 
-        try:
-            if os.path.isfile(audio_abs):
-                os.remove(audio_abs)
-        except Exception as e:
-            ConfigManager.console_print(f'Could not delete failed audio {audio_abs}: {e}')
-
+        # Do NOT delete the audio here. It lives in the recordings/ archive and
+        # is pruned by age at startup. Hard-deleting on retry-success is what
+        # destroyed the only copy of a recording on 2026-07-05 (an empty result
+        # was mis-treated as success, then this os.remove ran). The failed entry
+        # is removed below so the item leaves the "failed" list; the audio stays
+        # safely archived.
         if self._failed_log_path:
             _remove_failed_entry(self._failed_log_path, audio_rel)
 

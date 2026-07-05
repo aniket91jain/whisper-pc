@@ -1,5 +1,38 @@
 import yaml
 import os
+import logging
+from logging.handlers import RotatingFileHandler
+
+_file_logger = None
+
+
+def _get_file_logger():
+    """Lazily build a rotating file logger at <repo>/whisper_pc.log.
+
+    The app is launched with pythonw.exe (no console), so plain print() output
+    is discarded — which is exactly why the "could not save failed audio" error
+    was invisible on 2026-07-05. Every console_print() is mirrored here so no
+    diagnostic is ever lost again. Failures are swallowed: logging must never
+    break dictation."""
+    global _file_logger
+    if _file_logger is not None:
+        return _file_logger
+    logger = logging.getLogger('whisper_pc')
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_path = os.path.join(project_root, 'whisper_pc.log')
+        handler = RotatingFileHandler(
+            log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter('%(asctime)s  %(message)s'))
+        logger.addHandler(handler)
+    except Exception:
+        pass
+    _file_logger = logger
+    return logger
+
 
 class ConfigManager:
     _instance = None
@@ -137,6 +170,11 @@ class ConfigManager:
 
     @classmethod
     def console_print(cls, message):
-        """Print a message to the console if enabled in the configuration."""
+        """Print a message to the console if enabled, and ALWAYS persist it to
+        the rotating log file so nothing is lost under pythonw (no console)."""
+        try:
+            _get_file_logger().info(message)
+        except Exception:
+            pass
         if cls._instance and cls._instance.config['misc']['print_to_terminal']:
             print(message)
