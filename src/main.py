@@ -749,12 +749,30 @@ def _enforce_single_instance() -> None:
     except Exception:
         return  # be permissive if ctypes is unavailable (non-Windows debug)
     ERROR_ALREADY_EXISTS = 183
-    handle = kernel32.CreateMutexW(None, False, _SINGLETON_MUTEX_NAME)
+    # Read the CreateMutexW error via ctypes' own last-error capture, NOT a
+    # bare kernel32.GetLastError() call. A separate GetLastError() foreign call
+    # is unreliable: ctypes/interpreter syscalls between CreateMutexW and it
+    # clobber the thread's last-error, so ERROR_ALREADY_EXISTS was often read as
+    # 0 and a DUPLICATE instance launched. That is the root of the recurring
+    # multi-pythonw.exe bug (2026-05-13 / 05-15). Fixed 2026-07-06 by using a
+    # use_last_error=True binding + ctypes.get_last_error(), which ctypes latches
+    # atomically right after the call.
+    import ctypes
+    from ctypes import wintypes
+    try:
+        _k32_le = ctypes.WinDLL('kernel32', use_last_error=True)
+        _k32_le.CreateMutexW.restype = wintypes.HANDLE
+        _k32_le.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        ctypes.set_last_error(0)
+        handle = _k32_le.CreateMutexW(None, False, _SINGLETON_MUTEX_NAME)
+        err = ctypes.get_last_error()
+    except Exception:
+        return
     if not handle:
         # Could not create the mutex (rare). Fail open — better to launch than
         # to silently refuse to start.
         return
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if err == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
         signaled = _signal_existing_instance()
         # pythonw.exe has no console; this print only matters for python.exe debug
